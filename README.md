@@ -93,6 +93,7 @@ github-reviews run \
 The command:
 
 - runs from the registered worktree root;
+- is found from the directory where you start the daemon: a relative path such as `./scripts/review-pr` is made absolute at startup, and a bare name is found on `PATH`. The daemon does not start if the program is missing or is not executable;
 - inherits the daemon's environment, stdout, and stderr;
 - receives one versioned JSON object followed by a newline and EOF on stdin;
 - runs only after the exact current base and pull-request head objects have been fetched and verified without checkout.
@@ -105,18 +106,18 @@ github-reviews retry OWNER/REPO#123
 
 ## Example Codex reviewer
 
-[`examples/codex-review.py`](examples/codex-review.py) runs one headless Codex review with `gpt-5.6-sol` at high reasoning effort. It accepts one argument containing additional review instructions and receives the normal review envelope on stdin.
-
-Review commands run from the registered repository, so invoke the example by absolute path or install it somewhere on `PATH`:
+[`examples/codex-review.py`](examples/codex-review.py) runs one headless Codex review with `gpt-5.6-sol` at high reasoning effort. It accepts one optional argument that contains additional review instructions, and it receives the normal review envelope on stdin. From a checkout of this repository:
 
 ```sh
 github-reviews run \
   --mode async \
   --max-concurrency 1 \
   --review-timeout 15m \
-  --review-command /absolute/path/to/github-reviews/examples/codex-review.py \
+  --review-command ./examples/codex-review.py \
   'Concentrate on correctness, security, and missing tests.'
 ```
+
+Omit the last argument to run the review without additional instructions.
 
 The example requires Codex CLI 0.156 or newer, `gh` authenticated with permission to write pull-request reviews, and Python 3. It deliberately does not require `jq`.
 
@@ -135,9 +136,11 @@ github-reviews run \
   --mode async \
   --max-concurrency 1 \
   --review-timeout 15m \
-  --review-command /absolute/path/to/github-reviews/examples/claude-review.py \
+  --review-command ./examples/claude-review.py \
   'Concentrate on correctness, security, and missing tests.'
 ```
+
+As with the Codex example, the additional review instructions are optional.
 
 The example requires Claude Code 2.1.280 or newer, an authenticated Claude account or API configuration, `gh` authenticated with permission to write pull-request reviews, and Python 3.
 

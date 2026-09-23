@@ -8,6 +8,8 @@ use std::process::{Command, Output, Stdio};
 
 use serde_json::{Value, json};
 
+const INSTRUCTIONS: &str = "Pay particular attention to authorization boundaries.";
+
 fn write_executable(path: &Path, contents: &str) {
     fs::write(path, contents).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
@@ -69,6 +71,10 @@ impl Fixture {
     }
 
     fn run(&self, result: Value) -> Output {
+        self.run_with_instructions(result, Some(INSTRUCTIONS))
+    }
+
+    fn run_with_instructions(&self, result: Value, instructions: Option<&str>) -> Output {
         let response = json!({
             "type": "result",
             "subtype": "success",
@@ -76,10 +82,10 @@ impl Fixture {
             "result": "",
             "structured_output": result,
         });
-        self.run_response(response)
+        self.run_response(response, instructions)
     }
 
-    fn run_response(&self, response: Value) -> Output {
+    fn run_response(&self, response: Value, instructions: Option<&str>) -> Output {
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/claude-review.py");
         let path = format!(
             "{}:{}",
@@ -87,7 +93,7 @@ impl Fixture {
             std::env::var("PATH").unwrap_or_default()
         );
         let mut child = Command::new(script)
-            .arg("Pay particular attention to authorization boundaries.")
+            .args(instructions)
             .current_dir(&self.repository)
             .env("PATH", path)
             .env("CLAUDE_TEST_ARGUMENTS", &self.arguments)
@@ -148,7 +154,7 @@ fn claude_review_example_runs_with_guardrails_and_reports_operations() {
         "Edit",
         "Task",
         "Additional review instructions supplied by the operator",
-        "Pay particular attention to authorization boundaries.",
+        INSTRUCTIONS,
     ] {
         assert!(
             arguments.contains(expected),
@@ -186,18 +192,46 @@ fn claude_review_example_fails_when_the_agent_reports_partial_failure() {
 #[test]
 fn claude_review_example_fails_when_structured_output_is_missing() {
     let fixture = Fixture::new();
-    let output = fixture.run_response(json!({
-        "type": "result",
-        "subtype": "success",
-        "is_error": false,
-        "result": "Review complete",
-        "structured_output": null,
-    }));
+    let output = fixture.run_response(
+        json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "result": "Review complete",
+            "structured_output": null,
+        }),
+        Some(INSTRUCTIONS),
+    );
 
     assert_eq!(output.status.code(), Some(70));
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
             .contains("structured_output must be an object")
+    );
+}
+
+#[test]
+fn claude_review_example_runs_without_additional_instructions() {
+    let fixture = Fixture::new();
+    let output = fixture.run_with_instructions(
+        json!({
+            "status": "success",
+            "summary": "Reviewed the pull request and approved it.",
+            "operations": [{
+                "kind": "review",
+                "target": "https://github.com/acme/widgets/pull/42",
+                "summary": "Approved",
+            }],
+            "errors": [],
+        }),
+        None,
+    );
+
+    assert!(output.status.success(), "{output:?}");
+    let arguments = fs::read_to_string(&fixture.arguments).unwrap();
+    assert!(
+        !arguments.contains("Additional review instructions supplied by the operator"),
+        "unexpected operator section in {arguments}"
     );
 }

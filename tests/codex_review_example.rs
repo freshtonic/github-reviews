@@ -8,6 +8,8 @@ use std::process::{Command, Output, Stdio};
 
 use serde_json::{Value, json};
 
+const INSTRUCTIONS: &str = "Pay particular attention to authorization boundaries.";
+
 fn write_executable(path: &Path, contents: &str) {
     fs::write(path, contents).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
@@ -69,6 +71,10 @@ impl Fixture {
     }
 
     fn run(&self, result: Value) -> Output {
+        self.run_with_instructions(result, Some(INSTRUCTIONS))
+    }
+
+    fn run_with_instructions(&self, result: Value, instructions: Option<&str>) -> Output {
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/codex-review.py");
         let path = format!(
             "{}:{}",
@@ -76,7 +82,7 @@ impl Fixture {
             std::env::var("PATH").unwrap_or_default()
         );
         let mut child = Command::new(script)
-            .arg("Pay particular attention to authorization boundaries.")
+            .args(instructions)
             .current_dir(&self.repository)
             .env("PATH", path)
             .env("CODEX_TEST_ARGUMENTS", &self.arguments)
@@ -126,7 +132,7 @@ fn codex_review_example_runs_with_guardrails_and_reports_operations() {
         "network.enabled=true",
         "api.github.com",
         "Additional review instructions supplied by the operator",
-        "Pay particular attention to authorization boundaries.",
+        INSTRUCTIONS,
     ] {
         assert!(
             arguments.contains(expected),
@@ -158,5 +164,30 @@ fn codex_review_example_fails_when_the_agent_reports_partial_failure() {
         String::from_utf8(output.stderr)
             .unwrap()
             .contains("GitHub rejected an inline comment")
+    );
+}
+
+#[test]
+fn codex_review_example_runs_without_additional_instructions() {
+    let fixture = Fixture::new();
+    let output = fixture.run_with_instructions(
+        json!({
+            "status": "success",
+            "summary": "Reviewed the pull request and approved it.",
+            "operations": [{
+                "kind": "review",
+                "target": "https://github.com/acme/widgets/pull/42",
+                "summary": "Approved",
+            }],
+            "errors": [],
+        }),
+        None,
+    );
+
+    assert!(output.status.success(), "{output:?}");
+    let arguments = fs::read_to_string(&fixture.arguments).unwrap();
+    assert!(
+        !arguments.contains("Additional review instructions supplied by the operator"),
+        "unexpected operator section in {arguments}"
     );
 }

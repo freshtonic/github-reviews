@@ -161,11 +161,12 @@ def codex_command(schema_path: Path, operator_prompt: str) -> list[str]:
     # invocation. Other user configuration remains loaded, keeping configured
     # skills and plugins discoverable.
     profile = f"github_reviews_example_{os.getpid()}"
-    review_prompt = (
-        f"{FIXED_PROMPT}\n"
-        "Additional review instructions supplied by the operator:\n"
-        f"{operator_prompt}"
-    )
+    review_prompt = FIXED_PROMPT
+    if operator_prompt.strip():
+        review_prompt += (
+            "\nAdditional review instructions supplied by the operator:\n"
+            f"{operator_prompt}"
+        )
     return [
         "codex",
         "exec",
@@ -272,9 +273,9 @@ def validate_result(result: dict[str, object]) -> tuple[str, list[dict[str, str]
 
 
 def main() -> int:
-    if len(sys.argv) != 2 or not sys.argv[1]:
+    if len(sys.argv) > 2:
         print(
-            f"usage: {Path(sys.argv[0]).name} <additional-review-instructions>",
+            f"usage: {Path(sys.argv[0]).name} [additional-review-instructions]",
             file=sys.stderr,
         )
         return EX_USAGE
@@ -292,7 +293,8 @@ def main() -> int:
     if authenticated.returncode != 0:
         abort("gh is not authenticated to github.com", EX_NOPERM)
 
-    result = run_codex(read_envelope(), sys.argv[1])
+    operator_prompt = sys.argv[1] if len(sys.argv) == 2 else ""
+    result = run_codex(read_envelope(), operator_prompt)
     summary, operations, errors = validate_result(result)
 
     print(summary)
