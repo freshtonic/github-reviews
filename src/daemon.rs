@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -31,6 +32,79 @@ use crate::runner::{ReviewCommand, RunOutcome};
 const HOST: &str = "github.com";
 const LEASE_DURATION: TimeDelta = TimeDelta::seconds(90);
 const LEASE_HEARTBEAT: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InProgressReview {
+    repository: String,
+    pull: u64,
+    title: String,
+}
+
+#[derive(Default)]
+struct ShutdownState {
+    ctrl_c_received: bool,
+    reviews: HashMap<i64, InProgressReview>,
+}
+
+impl ShutdownState {
+    fn track(&mut self, action: &ReviewAction) {
+        self.reviews.insert(
+            action.id,
+            InProgressReview {
+                repository: action.repository_full_name.clone(),
+                pull: action.pull_request_number,
+                title: action.envelope.pull_request.title.clone(),
+            },
+        );
+    }
+
+    fn review_list(&self) -> String {
+        let mut reviews: Vec<_> = self
+            .reviews
+            .values()
+            .map(|review| format!("{}#{} {:?}", review.repository, review.pull, review.title))
+            .collect();
+        reviews.sort();
+        reviews.join(", ")
+    }
+
+    fn waiting_message(&self) -> String {
+        let waiting = self.reviews.len();
+        if waiting == 0 {
+            "waiting for 0 in-progress reviews to complete".into()
+        } else {
+            format!(
+                "waiting for {waiting} in-progress reviews to complete: {}",
+                self.review_list()
+            )
+        }
+    }
+}
+
+struct ReviewCompletionGuard {
+    action_id: i64,
+    shutdown: Arc<Mutex<ShutdownState>>,
+}
+
+impl Drop for ReviewCompletionGuard {
+    fn drop(&mut self) {
+        let mut shutdown = lock_shutdown(&self.shutdown);
+        shutdown.reviews.remove(&self.action_id);
+        if shutdown.ctrl_c_received {
+            let remaining = shutdown.reviews.len();
+            info!("review completed; {remaining} in-progress reviews remaining");
+            if remaining == 0 {
+                info!("all reviews completed, quitting");
+            }
+        }
+    }
+}
+
+fn lock_shutdown(shutdown: &Mutex<ShutdownState>) -> MutexGuard<'_, ShutdownState> {
+    shutdown
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 pub fn execute(cli: Cli) -> Result<()> {
     let path = state_path()?;
@@ -196,15 +270,34 @@ fn run(path: &Path, args: RunArgs) -> Result<()> {
     db.prune_90_days(now)?;
     drop(db);
 
-    let signals = Arc::new(AtomicUsize::new(0));
-    let signal_counter = Arc::clone(&signals);
-    ctrlc::set_handler(move || {
-        if signal_counter.fetch_add(1, Ordering::SeqCst) > 0 {
-            process::exit(130);
-        }
-    })?;
     let heartbeat_stop = Arc::new(AtomicBool::new(false));
     let lease_lost = Arc::new(AtomicBool::new(false));
+    let forced_abort = Arc::new(AtomicBool::new(false));
+    let signals = Arc::new(AtomicUsize::new(0));
+    let signal_counter = Arc::clone(&signals);
+    let shutdown = Arc::new(Mutex::new(ShutdownState::default()));
+    let signal_shutdown = Arc::clone(&shutdown);
+    let signal_cancellation = Arc::clone(&lease_lost);
+    let signal_forced_abort = Arc::clone(&forced_abort);
+    ctrlc::set_handler(move || {
+        if signal_counter.fetch_add(1, Ordering::SeqCst) > 0 {
+            info!(
+                "CTRL-C received again; immediately aborting and killing all in-progress reviews"
+            );
+            signal_forced_abort.store(true, Ordering::SeqCst);
+            signal_cancellation.store(true, Ordering::SeqCst);
+            return;
+        }
+        let mut shutdown = lock_shutdown(&signal_shutdown);
+        shutdown.ctrl_c_received = true;
+        info!("CTRL-C received; immediately stopping acceptance of new review requests");
+        info!("press CTRL-C again to immediately abort and kill all in-progress reviews");
+        let waiting_message = shutdown.waiting_message();
+        info!("{waiting_message}");
+        if shutdown.reviews.is_empty() {
+            info!("all reviews completed, quitting");
+        }
+    })?;
     let heartbeat = start_lease_heartbeat(
         path.to_path_buf(),
         viewer.clone(),
@@ -225,6 +318,8 @@ fn run(path: &Path, args: RunArgs) -> Result<()> {
         &review_command,
         &signals,
         &lease_lost,
+        &shutdown,
+        &forced_abort,
     );
     heartbeat_stop.store(true, Ordering::SeqCst);
     let _ = heartbeat.join();
@@ -243,6 +338,8 @@ fn run_loop(
     review_command: &ReviewCommand,
     signals: &AtomicUsize,
     lease_lost: &Arc<AtomicBool>,
+    shutdown: &Arc<Mutex<ShutdownState>>,
+    forced_abort: &AtomicBool,
 ) -> Result<()> {
     let git = GitTools::default();
     let mut workers: Vec<JoinHandle<()>> = Vec::new();
@@ -377,8 +474,14 @@ fn run_loop(
         if api_available && !lease_lost.load(Ordering::SeqCst) {
             match args.mode {
                 Mode::Sync => {
-                    if let Some(action) = db.claim_due_action(HOST, viewer.id, 1, Utc::now())? {
+                    if let Some(action) =
+                        claim_review_for_processing(&mut db, viewer.id, 1, signals, shutdown)?
+                    {
                         drop(db);
+                        let _completion = ReviewCompletionGuard {
+                            action_id: action.id,
+                            shutdown: Arc::clone(shutdown),
+                        };
                         process_action(
                             path,
                             &git,
@@ -395,8 +498,13 @@ fn run_loop(
                 }
                 Mode::Async => {
                     while workers.len() < args.max_concurrency {
-                        let Some(action) =
-                            db.claim_due_action(HOST, viewer.id, args.max_concurrency, Utc::now())?
+                        let Some(action) = claim_review_for_processing(
+                            &mut db,
+                            viewer.id,
+                            args.max_concurrency,
+                            signals,
+                            shutdown,
+                        )?
                         else {
                             break;
                         };
@@ -407,8 +515,13 @@ fn run_loop(
                         let viewer = viewer.clone();
                         let viewer_team_ids = viewer_team_ids.to_vec();
                         let lease_lost = Arc::clone(lease_lost);
+                        let shutdown = Arc::clone(shutdown);
                         let timeout = args.review_timeout;
                         workers.push(thread::spawn(move || {
+                            let _completion = ReviewCompletionGuard {
+                                action_id: action.id,
+                                shutdown,
+                            };
                             process_action(
                                 &state_path,
                                 &git,
@@ -435,11 +548,10 @@ fn run_loop(
         );
     }
 
-    info!("shutdown requested; waiting for review commands");
     for worker in workers {
         let _ = worker.join();
     }
-    if lease_lost.load(Ordering::SeqCst) {
+    if lease_lost.load(Ordering::SeqCst) && !forced_abort.load(Ordering::SeqCst) {
         bail!("daemon lease was lost; stopped before another daemon could take over");
     }
     Ok(())
@@ -1176,6 +1288,34 @@ fn chrono_duration(duration: Duration) -> TimeDelta {
     TimeDelta::from_std(duration).unwrap_or(TimeDelta::MAX)
 }
 
+fn claim_review_for_processing(
+    db: &mut Database,
+    viewer_id: i64,
+    max_concurrency: usize,
+    signals: &AtomicUsize,
+    shutdown: &Arc<Mutex<ShutdownState>>,
+) -> Result<Option<ReviewAction>> {
+    let mut shutdown = lock_shutdown(shutdown);
+    if signals.load(Ordering::SeqCst) > 0 {
+        return Ok(None);
+    }
+    let Some(action) = db.claim_due_action(HOST, viewer_id, max_concurrency, Utc::now())? else {
+        return Ok(None);
+    };
+    if signals.load(Ordering::SeqCst) > 0 {
+        let now = Utc::now();
+        db.defer_action(
+            action.id,
+            "daemon shutdown requested before review started",
+            now,
+            now,
+        )?;
+        return Ok(None);
+    }
+    shutdown.track(&action);
+    Ok(Some(action))
+}
+
 fn reap_workers(workers: &mut Vec<JoinHandle<()>>) {
     let mut index = 0;
     while index < workers.len() {
@@ -1204,6 +1344,40 @@ fn sleep_interruptibly(duration: Duration, signals: &AtomicUsize, lease_lost: &A
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shutdown_wait_message_lists_in_progress_reviews_in_stable_order() {
+        let mut shutdown = ShutdownState::default();
+        shutdown.reviews.insert(
+            2,
+            InProgressReview {
+                repository: "zeta/widgets".into(),
+                pull: 9,
+                title: "Second".into(),
+            },
+        );
+        shutdown.reviews.insert(
+            1,
+            InProgressReview {
+                repository: "acme/rockets".into(),
+                pull: 42,
+                title: "First".into(),
+            },
+        );
+
+        assert_eq!(
+            shutdown.waiting_message(),
+            "waiting for 2 in-progress reviews to complete: acme/rockets#42 \"First\", zeta/widgets#9 \"Second\""
+        );
+    }
+
+    #[test]
+    fn shutdown_wait_message_reports_zero_reviews() {
+        assert_eq!(
+            ShutdownState::default().waiting_message(),
+            "waiting for 0 in-progress reviews to complete"
+        );
+    }
 
     #[test]
     fn recognizes_secondary_rate_limit_from_error_body() {
