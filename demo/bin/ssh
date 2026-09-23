@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+if [ "${1:-}" = '-G' ]; then
+    printf 'hostname github.com\n'
+    exit 0
+fi
+
+exec git-upload-pack "$DEMO_GIT_ORIGIN"

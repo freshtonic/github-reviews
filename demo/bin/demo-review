@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+import json
+import sys
+
+envelope = json.load(sys.stdin)
+repository = envelope["repository"]["full_name"]
+pull_request = envelope["pull_request"]
+
+print(
+    f'Reviewing {repository}#{pull_request["number"]}: '
+    f'{pull_request["title"]}',
+    flush=True,
+)
+print("Demo review completed; no GitHub changes were made.", flush=True)

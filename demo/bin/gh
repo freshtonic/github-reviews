@@ -1,0 +1,51 @@
+#!/bin/sh
+set -eu
+
+endpoint=
+for argument in "$@"; do
+    endpoint=$argument
+done
+
+respond() {
+    status=$1
+    body=$2
+    printf 'HTTP/2 %s\nX-Poll-Interval: 1\n\n%s' "$status" "$body"
+}
+
+notification='[{"id":"demo-notification","reason":"review_requested","unread":true,"updated_at":"2030-01-01T00:00:00Z","repository":{"id":7,"full_name":"acme/widgets"},"subject":{"title":"Add retry support","type":"PullRequest","url":"https://api.github.com/repos/acme/widgets/pulls/42"}}]'
+
+case "$endpoint" in
+    /user)
+        respond '200 OK' '{"id":1,"login":"demo-user"}'
+        ;;
+    '/user/teams?per_page=100')
+        respond '200 OK' '[]'
+        ;;
+    /repos/acme/widgets)
+        respond '200 OK' '{"id":7,"full_name":"acme/widgets","html_url":"https://github.com/acme/widgets"}'
+        ;;
+    '/repos/acme/widgets/notifications?all=true&per_page=100')
+        respond '200 OK' "$notification"
+        ;;
+    '/notifications?all=true&per_page=50')
+        respond '304 Not Modified' ''
+        exit 1
+        ;;
+    /repos/acme/widgets/pulls/42/requested_reviewers)
+        respond '200 OK' '{"users":[{"id":1,"login":"demo-user"}],"teams":[]}'
+        ;;
+    '/repos/acme/widgets/pulls/42/reviews?per_page=100')
+        respond '200 OK' '[]'
+        ;;
+    '/repos/acme/widgets/issues/42/timeline?per_page=100')
+        respond '200 OK' '[{"id":20,"node_id":"RRE_demo","event":"review_requested","created_at":"2030-01-01T00:00:00Z","requested_reviewer":{"id":1,"login":"demo-user"}}]'
+        ;;
+    /repos/acme/widgets/pulls/42)
+        body=$(printf '{"id":99,"number":42,"html_url":"https://github.com/acme/widgets/pull/42","title":"Add retry support","user":{"id":2,"login":"octo-author"},"state":"open","draft":false,"merged":false,"head":{"sha":"%s","ref":"retry-support"},"base":{"sha":"%s","ref":"main"}}' "$DEMO_HEAD_SHA" "$DEMO_BASE_SHA")
+        respond '200 OK' "$body"
+        ;;
+    *)
+        printf 'demo gh: unexpected endpoint %s\n' "$endpoint" >&2
+        exit 2
+        ;;
+esac

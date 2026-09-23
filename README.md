@@ -2,17 +2,60 @@
 
 `github-reviews` polls GitHub review-request notifications and runs a local review command from the matching repository clone. It is designed for review scripts that delegate to an LLM and benefit from local Git history.
 
+## Demo
+
+This deterministic demo uses synthetic GitHub data and an inert Automated Review Command. It performs no GitHub mutations. To regenerate it, run `demo/render.sh` (requires [VHS](https://github.com/charmbracelet/vhs) and FFmpeg).
+
+![Terminal demo showing github-reviews installation, repository registration, review-command launch, and graceful shutdown](docs/assets/github-reviews-demo.gif)
+
+<details>
+<summary>Demo transcript</summary>
+
+Log lines are shortened: the timestamp, level, and module prefix are removed. Two pull request discovery log lines are also removed.
+
+```console
+$ cargo install --locked --path .
+  Installing github-reviews v0.1.0 (~/src/github-reviews)
+    Finished `release` profile [optimized] target(s)
+   Installed package `github-reviews v0.1.0 (~/src/github-reviews)` (executable `github-reviews`)
+$ cd ~/src/acme/widgets
+$ github-reviews register
+registered acme/widgets at ~/src/acme/widgets
+$ github-reviews status
+state: /tmp/github-reviews-readme-demo/state.sqlite3
+registered repositories: 1
+  acme/widgets -> ~/src/acme/widgets
+actions: 0 pending, 0 running, 0 parked, 0 succeeded, 0 cancelled
+$ github-reviews run --interval 1s --review-command demo-review
+daemon started viewer=demo-user
+repository bootstrap complete repository=acme/widgets
+review action queued repository=acme/widgets pull=42 action=1 reason="review_requested"
+launching review command for (#42) Add retry support action=1 repository=acme/widgets
+Reviewing acme/widgets#42: Add retry support
+Demo review completed; no GitHub changes were made.
+review command succeeded action=1 repository=acme/widgets pull=42
+^C
+CTRL-C received; immediately stopping acceptance of new review requests
+press CTRL-C again to immediately abort and kill all in-progress reviews
+waiting for 0 in-progress reviews to complete
+all reviews completed, quitting
+```
+
+</details>
+
 ## Requirements
 
 - Rust 1.85 or newer
 - Git
 - [GitHub CLI](https://cli.github.com/) authenticated to GitHub.com with a classic token that can read notifications and the registered repositories
 
-## Build
+## Install
 
 ```sh
-cargo build --release
+cargo install --locked --path .
 ```
+
+This installs `github-reviews` into Cargo's binary directory (`~/.cargo/bin` by default). Ensure that directory is on `PATH` before continuing.
 
 ## Register repositories
 
