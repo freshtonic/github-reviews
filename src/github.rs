@@ -24,6 +24,7 @@ use crate::model::{
     Notification, OpinionatedReview, PullRequestState, RepositoryIdentity, ReviewRequestEvent,
     ReviewRequestKind, ReviewState, Viewer,
 };
+use crate::runner::{configure_process_group, terminate_and_reap};
 
 const API_HOST: &str = "github.com";
 const API_URL_PREFIX: &str = "https://api.github.com";
@@ -143,7 +144,7 @@ impl std::error::Error for GhError {
 #[derive(Clone, Debug)]
 pub struct GhClient {
     executable: OsString,
-    cancelled: Option<Arc<AtomicBool>>,
+    cancelled: Vec<Arc<AtomicBool>>,
 }
 
 impl Default for GhClient {
@@ -160,15 +161,16 @@ impl GhClient {
     pub fn with_executable(executable: impl Into<OsString>) -> Self {
         Self {
             executable: executable.into(),
-            cancelled: None,
+            cancelled: Vec::new(),
         }
     }
 
+    /// Return a client whose requests are also cancelled when `cancelled` is
+    /// set. Flags from this client remain in effect.
     pub fn with_cancellation(&self, cancelled: Arc<AtomicBool>) -> Self {
-        Self {
-            executable: self.executable.clone(),
-            cancelled: Some(cancelled),
-        }
+        let mut client = self.clone();
+        client.cancelled.push(cancelled);
+        client
     }
 
     pub fn viewer(&self) -> Result<Viewer> {
@@ -463,6 +465,7 @@ impl GhClient {
         }
         command.arg(endpoint);
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        configure_process_group(&mut command);
         let mut child = command.spawn().map_err(|source| GhError::Spawn {
             executable: PathBuf::from(&self.executable),
             source,
@@ -481,11 +484,10 @@ impl GhClient {
         let status = loop {
             if self
                 .cancelled
-                .as_ref()
-                .is_some_and(|flag| flag.load(Ordering::SeqCst))
+                .iter()
+                .any(|flag| flag.load(Ordering::SeqCst))
             {
-                let _ = child.kill();
-                let _ = child.wait();
+                let _ = terminate_and_reap(&mut child);
                 drop(stdout_reader);
                 drop(stderr_reader);
                 return Err(GhError::Cancelled {
@@ -494,8 +496,7 @@ impl GhClient {
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                let _ = child.kill();
-                let _ = child.wait();
+                let _ = terminate_and_reap(&mut child);
                 drop(stdout_reader);
                 drop(stderr_reader);
                 return Err(GhError::Timeout {

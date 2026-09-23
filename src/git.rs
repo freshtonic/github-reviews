@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 
 use wait_timeout::ChildExt;
 
+use crate::runner::{configure_process_group, terminate_and_reap};
+
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -590,6 +592,7 @@ fn run_output<'a>(
     for (key, value) in envs {
         command.env(key, value);
     }
+    configure_process_group(&mut command);
     let mut child = command.spawn()?;
     let mut stdout = child.stdout.take().expect("stdout was piped");
     let mut stderr = child.stderr.take().expect("stderr was piped");
@@ -605,16 +608,14 @@ fn run_output<'a>(
     let deadline = Instant::now() + timeout;
     let status = loop {
         if cancelled.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = terminate_and_reap(&mut child);
             drop(stdout_reader);
             drop(stderr_reader);
             return Err(GitError::Cancelled { operation });
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = terminate_and_reap(&mut child);
             drop(stdout_reader);
             drop(stderr_reader);
             return Err(GitError::CommandTimedOut { operation, timeout });

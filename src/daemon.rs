@@ -95,9 +95,6 @@ impl Drop for ReviewCompletionGuard {
         if shutdown.ctrl_c_received {
             let remaining = shutdown.reviews.len();
             info!("review completed; {remaining} in-progress reviews remaining");
-            if remaining == 0 {
-                info!("all reviews completed, quitting");
-            }
         }
     }
 }
@@ -282,7 +279,13 @@ fn run(path: &Path, args: RunArgs) -> Result<()> {
     let signal_shutdown = Arc::clone(&shutdown);
     let signal_cancellation = Arc::clone(&lease_lost);
     let signal_forced_abort = Arc::clone(&forced_abort);
+    // Polling work (bootstrap, discovery, refresh) holds no review state that
+    // must finish, so the first CTRL-C cancels it at once. In-progress reviews
+    // use a client that only a second CTRL-C or a lost lease cancels.
+    let polling_stop = Arc::new(AtomicBool::new(false));
+    let signal_polling_stop = Arc::clone(&polling_stop);
     ctrlc::set_handler(move || {
+        signal_polling_stop.store(true, Ordering::SeqCst);
         if signal_counter.fetch_add(1, Ordering::SeqCst) > 0 {
             info!(
                 "CTRL-C received again; immediately aborting and killing all in-progress reviews"
@@ -297,9 +300,6 @@ fn run(path: &Path, args: RunArgs) -> Result<()> {
         info!("press CTRL-C again to immediately abort and kill all in-progress reviews");
         let waiting_message = shutdown.waiting_message();
         info!("{waiting_message}");
-        if shutdown.reviews.is_empty() {
-            info!("all reviews completed, quitting");
-        }
     })?;
     let heartbeat = start_lease_heartbeat(
         path.to_path_buf(),
@@ -309,12 +309,14 @@ fn run(path: &Path, args: RunArgs) -> Result<()> {
         Arc::clone(&lease_lost),
     );
     let daemon_gh = gh.with_cancellation(Arc::clone(&lease_lost));
+    let polling_gh = daemon_gh.with_cancellation(polling_stop);
 
     info!(viewer = %viewer.login, "daemon started");
     let result = run_loop(
         path,
         &args,
         &daemon_gh,
+        &polling_gh,
         &viewer,
         &viewer_team_ids,
         trust_notification_for_teams,
@@ -324,6 +326,9 @@ fn run(path: &Path, args: RunArgs) -> Result<()> {
         &shutdown,
         &forced_abort,
     );
+    if signals.load(Ordering::SeqCst) > 0 && !forced_abort.load(Ordering::SeqCst) {
+        info!("all reviews completed, quitting");
+    }
     heartbeat_stop.store(true, Ordering::SeqCst);
     let _ = heartbeat.join();
     Database::open(path)?.release_lease(HOST, viewer.id, &lease_owner)?;
@@ -335,6 +340,7 @@ fn run_loop(
     path: &Path,
     args: &RunArgs,
     gh: &GhClient,
+    polling_gh: &GhClient,
     viewer: &Viewer,
     viewer_team_ids: &[i64],
     trust_notification_for_teams: bool,
@@ -346,8 +352,9 @@ fn run_loop(
 ) -> Result<()> {
     let git = GitTools::default();
     let mut workers: Vec<JoinHandle<()>> = Vec::new();
+    let stopping = || signals.load(Ordering::SeqCst) > 0 || lease_lost.load(Ordering::SeqCst);
 
-    while signals.load(Ordering::SeqCst) == 0 && !lease_lost.load(Ordering::SeqCst) {
+    while !stopping() {
         reap_workers(&mut workers);
         let cycle_started = Instant::now();
         let now = Utc::now();
@@ -366,7 +373,7 @@ fn run_loop(
 
         let mut bootstrap_rate_delay = None;
         for registration in &registrations {
-            if lease_lost.load(Ordering::SeqCst) {
+            if stopping() {
                 break;
             }
             if db.bootstrap_pending(HOST, viewer.id, registration.repository.repository.id)?
@@ -374,7 +381,8 @@ fn run_loop(
             {
                 continue;
             }
-            match gh.bootstrap_notifications(&registration.repository.repository.full_name) {
+            match polling_gh.bootstrap_notifications(&registration.repository.repository.full_name)
+            {
                 Ok(poll) => {
                     let values = notification_values(&poll.notifications)?;
                     db.commit_bootstrap(
@@ -386,6 +394,7 @@ fn run_loop(
                     )?;
                     info!(repository = %registration.repository.repository.full_name, "repository bootstrap complete");
                 }
+                Err(GhError::Cancelled { .. }) => break,
                 Err(error) => {
                     warn!(repository = %registration.repository.repository.full_name, %error, "repository bootstrap failed");
                     if is_rate_limited(&error) {
@@ -404,8 +413,10 @@ fn run_loop(
             .and_then(|value| value.parse().ok());
         let (server_interval, mut api_available) = if bootstrap_rate_delay.is_some() {
             (bootstrap_rate_delay, false)
+        } else if stopping() {
+            (None, false)
         } else {
-            match gh.poll_global_notifications(
+            match polling_gh.poll_global_notifications(
                 poll_state
                     .as_ref()
                     .and_then(|state| state.last_modified.as_deref()),
@@ -444,6 +455,7 @@ fn run_loop(
                         (server_interval, true)
                     }
                 }
+                Err(GhError::Cancelled { .. }) => (None, false),
                 Err(error) => {
                     let retry_delay = retry_delay_for_gh_error(&error);
                     warn!(%error, "notification poll failed");
@@ -452,29 +464,31 @@ fn run_loop(
             }
         };
 
-        if api_available && !lease_lost.load(Ordering::SeqCst) {
+        if api_available && !stopping() {
             api_available = process_discoveries(
                 &mut db,
-                gh,
+                polling_gh,
                 viewer,
                 viewer_team_ids,
                 trust_notification_for_teams,
                 &by_id,
+                &stopping,
             )?;
         }
-        if api_available && !lease_lost.load(Ordering::SeqCst) {
+        if api_available && !stopping() {
             api_available = refresh_tracked(
                 &mut db,
-                gh,
+                polling_gh,
                 viewer,
                 viewer_team_ids,
                 trust_notification_for_teams,
                 &by_id,
                 args.interval,
+                &stopping,
             )?;
         }
 
-        if api_available && !lease_lost.load(Ordering::SeqCst) {
+        if api_available && !stopping() {
             match args.mode {
                 Mode::Sync => {
                     if let Some(action) =
@@ -568,6 +582,7 @@ fn process_discoveries(
     viewer_team_ids: &[i64],
     trust_notification_for_teams: bool,
     registrations: &HashMap<i64, RegisteredRepositoryRecord>,
+    stopping: &dyn Fn() -> bool,
 ) -> Result<bool> {
     let started = Instant::now();
     let pending = db.due_discovery_count(HOST, viewer.id, Utc::now())?;
@@ -583,6 +598,10 @@ fn process_discoveries(
     let mut api_available = true;
     let mut reported_registrations = HashSet::new();
     for _ in 0..DISCOVERY_BATCH_LIMIT {
+        if stopping() {
+            api_available = false;
+            break;
+        }
         if processed > 0 && processed % DISCOVERY_PROGRESS_INTERVAL == 0 {
             let remaining = db.due_discovery_count(HOST, viewer.id, Utc::now())?;
             info!(
@@ -636,6 +655,20 @@ fn process_discoveries(
             {
                 db.complete_discovery(HOST, viewer.id, &discovery.notification_id, now)?;
                 continue;
+            }
+            Err(GhError::Cancelled { .. }) => {
+                // The daemon is stopping. Leave the discovery due now so the
+                // next daemon picks it up without a retry delay.
+                db.defer_discovery(
+                    HOST,
+                    viewer.id,
+                    &discovery.notification_id,
+                    "daemon stopped while notification discovery was running",
+                    now,
+                    now,
+                )?;
+                api_available = false;
+                break;
             }
             Err(error) => {
                 let delay = retry_delay_for_gh_error(&error).unwrap_or_else(|| {
@@ -769,9 +802,13 @@ fn refresh_tracked(
     trust_notification_for_teams: bool,
     registrations: &HashMap<i64, RegisteredRepositoryRecord>,
     interval: Duration,
+    stopping: &dyn Fn() -> bool,
 ) -> Result<bool> {
     let now = Utc::now();
     for mut tracked in db.due_tracked_pull_requests(HOST, viewer.id, now, 1000)? {
+        if stopping() {
+            return Ok(false);
+        }
         let Some(registration) = registrations.get(&tracked.repository_id) else {
             db.deactivate_tracked_pull_request(
                 HOST,
@@ -821,6 +858,7 @@ fn refresh_tracked(
                 )?;
                 continue;
             }
+            Err(GhError::Cancelled { .. }) => return Ok(false),
             Err(error) => {
                 warn!(repository = %tracked.repository_full_name, pull = tracked.pull_request.number, %error, "could not refresh pull request");
                 if is_rate_limited(&error) {

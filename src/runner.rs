@@ -186,18 +186,24 @@ fn is_executable_file(path: &Path) -> bool {
     path.is_file()
 }
 
+/// Start a child in a fresh process group.
+///
+/// This lets a timeout or cancellation terminate descendants as well as the
+/// direct child. It also keeps the terminal's CTRL-C, which is delivered to
+/// the whole foreground process group, away from children: the daemon decides
+/// what a CTRL-C stops.
 #[cfg(unix)]
-fn configure_process_group(command: &mut Command) {
-    // A fresh process group lets a timeout terminate descendants as well as
-    // the directly spawned review command.
+pub(crate) fn configure_process_group(command: &mut Command) {
     command.process_group(0);
 }
 
 #[cfg(not(unix))]
-fn configure_process_group(_command: &mut Command) {}
+pub(crate) fn configure_process_group(_command: &mut Command) {}
 
+/// Kill the process group of a child started with [`configure_process_group`]
+/// and wait for the child.
 #[cfg(unix)]
-fn terminate_and_reap(child: &mut Child) -> std::io::Result<()> {
+pub(crate) fn terminate_and_reap(child: &mut Child) -> std::io::Result<()> {
     let process_group = i32::try_from(child.id()).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -225,7 +231,7 @@ fn terminate_and_reap(child: &mut Child) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn terminate_and_reap(child: &mut Child) -> std::io::Result<()> {
+pub(crate) fn terminate_and_reap(child: &mut Child) -> std::io::Result<()> {
     match child.kill() {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {}
