@@ -250,7 +250,8 @@ fn run(path: &Path, args: RunArgs) -> Result<()> {
             (Vec::new(), true)
         }
     };
-    let review_command = ReviewCommand::new(args.review_command.clone())?;
+    let review_command = ReviewCommand::new(args.review_command.clone())?
+        .resolve(&std::env::current_dir().context("read current directory")?)?;
     let lease_owner = format!("{}:{}", process::id(), Uuid::new_v4());
     let now = Utc::now();
     let mut db = Database::open(path)?;

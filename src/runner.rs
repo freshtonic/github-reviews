@@ -3,7 +3,7 @@
 use std::ffi::OsString;
 use std::fmt;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -37,6 +37,39 @@ impl ReviewCommand {
 
     pub fn argv(&self) -> &[OsString] {
         &self.argv
+    }
+
+    /// Resolve the program against the daemon's working directory and confirm
+    /// that it can be started.
+    ///
+    /// Commands run from each registered repository's worktree, and Unix
+    /// resolves a relative program path such as `./review.py` from the
+    /// child's new working directory. Anchoring it here keeps the path
+    /// meaning what it meant where the operator typed it. A bare program name
+    /// is left for `PATH` lookup, which is checked now so that a typo fails at
+    /// startup rather than on every review attempt.
+    pub fn resolve(mut self, working_directory: &Path) -> Result<Self, RunnerError> {
+        let program = PathBuf::from(&self.argv[0]);
+        if program.components().count() > 1 || program.is_absolute() {
+            let program = if program.is_absolute() {
+                program
+            } else {
+                working_directory.join(program)
+            };
+            if !is_executable_file(&program) {
+                return Err(RunnerError::ProgramNotFound(program));
+            }
+            self.argv[0] = program.into_os_string();
+        } else {
+            let found = std::env::var_os("PATH").is_some_and(|path| {
+                std::env::split_paths(&path)
+                    .any(|directory| is_executable_file(&directory.join(&program)))
+            });
+            if !found {
+                return Err(RunnerError::ProgramNotFound(program));
+            }
+        }
+        Ok(self)
     }
 
     /// Execute one review command and block until it exits or times out.
@@ -142,6 +175,18 @@ impl ReviewCommand {
 }
 
 #[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
+#[cfg(unix)]
 fn configure_process_group(command: &mut Command) {
     // A fresh process group lets a timeout terminate descendants as well as
     // the directly spawned review command.
@@ -202,6 +247,7 @@ unsafe extern "C" {
 #[derive(Debug)]
 pub enum RunnerError {
     EmptyCommand,
+    ProgramNotFound(PathBuf),
     Serialize(serde_json::Error),
     Spawn(std::io::Error),
     WriteInput(std::io::Error),
@@ -213,6 +259,11 @@ impl fmt::Display for RunnerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyCommand => write!(f, "review command must include a program"),
+            Self::ProgramNotFound(program) => write!(
+                f,
+                "review command {} is not an executable file",
+                program.display()
+            ),
             Self::Serialize(error) => {
                 write!(f, "could not serialize review command input: {error}")
             }
@@ -229,7 +280,7 @@ impl std::error::Error for RunnerError {
         match self {
             Self::Serialize(error) => Some(error),
             Self::Spawn(error) | Self::WriteInput(error) | Self::Wait(error) => Some(error),
-            Self::EmptyCommand | Self::InputWriterPanicked => None,
+            Self::EmptyCommand | Self::ProgramNotFound(_) | Self::InputWriterPanicked => None,
         }
     }
 }
@@ -374,6 +425,42 @@ mod tests {
             !root.path().join("cancelled-descendant-survived").exists(),
             "descendant process survived review cancellation"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_program_runs_from_the_daemon_directory_not_the_worktree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let daemon_directory = tempdir().unwrap();
+        let worktree = tempdir().unwrap();
+        let script = daemon_directory.path().join("review.sh");
+        fs::write(&script, "#!/bin/sh\ncat > reviewed.json\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let command = ReviewCommand::new([OsStr::new("./review.sh")])
+            .unwrap()
+            .resolve(daemon_directory.path())
+            .unwrap();
+        let outcome = command.execute(worktree.path(), &json!({}), None).unwrap();
+
+        assert!(outcome.is_success());
+        assert!(worktree.path().join("reviewed.json").exists());
+    }
+
+    #[test]
+    fn resolve_rejects_a_missing_program() {
+        let daemon_directory = tempdir().unwrap();
+        for program in ["./missing-review.sh", "github-reviews-missing-program"] {
+            let error = ReviewCommand::new([OsStr::new(program)])
+                .unwrap()
+                .resolve(daemon_directory.path())
+                .unwrap_err();
+            assert!(
+                matches!(error, RunnerError::ProgramNotFound(_)),
+                "{program}"
+            );
+        }
     }
 
     #[test]
