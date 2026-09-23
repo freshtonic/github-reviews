@@ -51,9 +51,10 @@ fn state_path() -> Result<PathBuf> {
 }
 
 fn register(path: &Path) -> Result<()> {
+    let current_dir = env::current_dir().context("resolve current working directory")?;
     let local = GitTools::default()
-        .discover(env::current_dir()?)
-        .context("discover current repository")?;
+        .discover(&current_dir)
+        .with_context(|| format!("discover current repository from {}", current_dir.display()))?;
     let repository = GhClient::new()
         .resolve_repository(&local.origin.full_name())
         .context("resolve origin through GitHub")?;
@@ -73,9 +74,10 @@ fn register(path: &Path) -> Result<()> {
 }
 
 fn unregister(path: &Path) -> Result<()> {
+    let current_dir = env::current_dir().context("resolve current working directory")?;
     let local = GitTools::default()
-        .discover(env::current_dir()?)
-        .context("discover current repository")?;
+        .discover(&current_dir)
+        .with_context(|| format!("discover current repository from {}", current_dir.display()))?;
     let repository = GhClient::new()
         .resolve_repository(&local.origin.full_name())
         .context("resolve origin through GitHub")?;
@@ -1056,6 +1058,13 @@ fn process_action_inner(
         envelope.request.event_id = request.event_id.clone();
     }
 
+    info!(
+        action = action.id,
+        repository = %canonical_name,
+        "launching review command for (#{}) {}",
+        action.pull_request_number,
+        current_pull.title
+    );
     match command.execute_with_cancel(&local.worktree_root, &envelope, timeout, cancelled) {
         Ok(RunOutcome::Succeeded) => {
             db.complete_action(action.id, Utc::now())?;

@@ -797,13 +797,18 @@ struct ReviewResponse {
 }
 
 #[derive(Deserialize)]
-struct TimelineEvent {
-    id: i64,
-    node_id: Option<String>,
-    event: String,
-    created_at: DateTime<Utc>,
-    requested_reviewer: Option<Viewer>,
-    requested_team: Option<TeamId>,
+#[serde(tag = "event")]
+enum TimelineEvent {
+    #[serde(rename = "review_requested")]
+    ReviewRequested {
+        id: i64,
+        node_id: Option<String>,
+        created_at: DateTime<Utc>,
+        requested_reviewer: Option<Viewer>,
+        requested_team: Option<TeamId>,
+    },
+    #[serde(other)]
+    Other,
 }
 
 impl TimelineEvent {
@@ -814,17 +819,23 @@ impl TimelineEvent {
         trust_team_notification: bool,
         currently_requested_team_ids: &HashSet<i64>,
     ) -> Option<ReviewRequestEvent> {
-        if self.event != "review_requested" {
+        let Self::ReviewRequested {
+            id,
+            node_id,
+            created_at,
+            requested_reviewer,
+            requested_team,
+        } = self
+        else {
             return None;
-        }
-        let (kind, requested_id) = if self
-            .requested_reviewer
+        };
+        let (kind, requested_id) = if requested_reviewer
             .as_ref()
             .is_some_and(|requested| requested.id == viewer.id)
         {
             (ReviewRequestKind::User, viewer.id)
         } else {
-            let team_id = self.requested_team?.id;
+            let team_id = requested_team?.id;
             let belongs_to_viewer = viewer_team_ids.contains(&team_id);
             let trusted_active_team =
                 trust_team_notification && currently_requested_team_ids.contains(&team_id);
@@ -834,8 +845,8 @@ impl TimelineEvent {
             (ReviewRequestKind::Team, team_id)
         };
         Some(ReviewRequestEvent {
-            event_id: self.node_id.unwrap_or_else(|| self.id.to_string()),
-            created_at: self.created_at,
+            event_id: node_id.unwrap_or_else(|| id.to_string()),
+            created_at,
             kind,
             requested_id,
         })
@@ -964,10 +975,9 @@ mod tests {
 
     #[test]
     fn trusted_notification_accepts_an_active_team_request_event() {
-        let event = || TimelineEvent {
+        let event = || TimelineEvent::ReviewRequested {
             id: 21,
             node_id: Some("RRE_team".into()),
-            event: "review_requested".into(),
             created_at: "2030-01-03T00:00:00Z".parse().unwrap(),
             requested_reviewer: None,
             requested_team: Some(TeamId { id: 77 }),
@@ -1103,7 +1113,7 @@ case "$*" in
   *requested_reviewers*) body='{"users":[{"id":1,"login":"me"}],"teams":[{"id":77}]}' ; link='' ;;
   *reviews*page=2*) body='[{"id":12,"user":{"id":1,"login":"me"},"state":"CHANGES_REQUESTED","commit_id":"old-head","submitted_at":"2030-01-02T00:00:00Z"}]' ; link='' ;;
   *reviews*) body='[{"id":11,"user":{"id":1,"login":"me"},"state":"APPROVED","commit_id":"older-head","submitted_at":"2030-01-01T00:00:00Z"},{"id":13,"user":{"id":2,"login":"other"},"state":"APPROVED","commit_id":"head","submitted_at":"2030-01-03T00:00:00Z"}]' ; link='Link: <https://api.github.com/repos/acme/widgets/pulls/42/reviews?per_page=100&page=2>; rel="next"' ;;
-  *timeline*) body='[{"id":20,"node_id":"RRE_user","event":"review_requested","created_at":"2030-01-01T00:00:00Z","requested_reviewer":{"id":1,"login":"me"}},{"id":21,"node_id":"RRE_team","event":"review_requested","created_at":"2030-01-03T00:00:00Z","requested_team":{"id":77}}]' ; link='' ;;
+  *timeline*) body='[{"event":"cross-referenced","created_at":"2030-01-02T00:00:00Z"},{"id":20,"node_id":"RRE_user","event":"review_requested","created_at":"2030-01-01T00:00:00Z","requested_reviewer":{"id":1,"login":"me"}},{"id":21,"node_id":"RRE_team","event":"review_requested","created_at":"2030-01-03T00:00:00Z","requested_team":{"id":77}}]' ; link='' ;;
   *pulls/42*) body='{"id":99,"number":42,"html_url":"https://github.com/acme/widgets/pull/42","title":"Change","user":{"id":3,"login":"author"},"state":"open","draft":false,"merged":false,"head":{"sha":"head","ref":"feature"},"base":{"sha":"base","ref":"main"}}' ; link='' ;;
   *) exit 2 ;;
 esac

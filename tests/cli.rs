@@ -84,3 +84,23 @@ fn register_discovers_origin_and_persists_mapping() {
             repository.to_string_lossy().as_ref(),
         ));
 }
+
+#[test]
+fn repository_discovery_errors_identify_working_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    let working_directory = directory.path().canonicalize().unwrap();
+    let state = directory.path().join("state.sqlite3");
+
+    for command in ["register", "unregister"] {
+        Command::cargo_bin("github-reviews")
+            .unwrap()
+            .current_dir(&working_directory)
+            .env("GITHUB_REVIEWS_STATE_PATH", &state)
+            .arg(command)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                working_directory.to_string_lossy().as_ref(),
+            ));
+    }
+}
