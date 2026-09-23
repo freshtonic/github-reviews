@@ -40,6 +40,14 @@ _Avoid_: Rejected, failed review
 The external program configured with `--review-command` and invoked for an actionable review request from the registered repository's local worktree root. It receives a stable, tool-owned JSON object describing the request on standard input.
 _Avoid_: Handler, action, callback
 
+**Automated Review Command**:
+A review command that runs an agent with read-only access to the registered repository and authority to apply Review Operations directly to the exact pull request in its input envelope. It reports what it did on standard output and fails unless every operation it chose succeeds.
+_Avoid_: Review bot, reviewer
+
+**Review Operation**:
+A review-specific GitHub mutation chosen by an automated reviewer: submitting a verdict, creating a general or inline comment, replying to a review thread, or resolving or unresolving a thread. Repository administration and pull-request lifecycle changes are outside this authority.
+_Avoid_: GitHub action, repository operation
+
 **Review Action**:
 A durable decision to run a review command for a particular pull request head and triggering request or review. A successful action is not repeated unless the head or triggering request changes.
 _Avoid_: Delivery, notification event, job
