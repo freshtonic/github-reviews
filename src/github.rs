@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fmt;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
@@ -31,6 +31,14 @@ const API_URL_PREFIX: &str = "https://api.github.com";
 const ACCEPT_HEADER: &str = "Accept: application/vnd.github+json";
 const API_VERSION_HEADER: &str = "X-GitHub-Api-Version: 2022-11-28";
 const GH_COMMAND_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Pull requests read by one GraphQL query. Each reads three connections of
+/// up to 100 nodes, so a full batch costs one GraphQL rate-limit point.
+pub const PULL_REQUEST_BATCH_SIZE: usize = 25;
+
+/// REST represents the author of a deleted account as this `ghost` user;
+/// GraphQL returns a null author instead.
+const GHOST_USER_ID: i64 = 10137;
 
 pub type Result<T> = std::result::Result<T, GhError>;
 
@@ -78,6 +86,9 @@ pub enum GhError {
     Cancelled {
         endpoint: String,
     },
+    NotFound {
+        what: String,
+    },
 }
 
 impl GhError {
@@ -88,6 +99,15 @@ impl GhError {
             Self::Status { metadata, .. } => Some(metadata.as_ref()),
             _ => None,
         }
+    }
+
+    /// True when the repository or pull request no longer exists, or is no
+    /// longer visible to the viewer.
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::NotFound { .. })
+            || self
+                .metadata()
+                .is_some_and(|metadata| metadata.status == 404)
     }
 }
 
@@ -126,6 +146,7 @@ impl fmt::Display for GhError {
                 write!(f, "gh API request {endpoint} timed out after 45 seconds")
             }
             Self::Cancelled { endpoint } => write!(f, "gh API request {endpoint} was cancelled"),
+            Self::NotFound { what } => write!(f, "GitHub could not find {what}"),
         }
     }
 }
@@ -245,119 +266,261 @@ impl GhClient {
         viewer_team_ids: &[i64],
         trust_team_notification: bool,
     ) -> Result<PullRequestState> {
-        validate_full_name(full_name)?;
-        let prefix = format!("/repos/{full_name}/pulls/{number}");
-        let pull: PullResponse = self.get_json(&prefix)?;
-        let requests: RequestedReviewers =
-            self.get_json(&format!("{prefix}/requested_reviewers"))?;
-        let reviews: Vec<ReviewResponse> =
-            self.get_all_pages(&format!("{prefix}/reviews?per_page=100"), &[])?;
-        let timeline: Vec<TimelineEvent> = self.get_all_pages(
-            &format!("/repos/{full_name}/issues/{number}/timeline?per_page=100"),
-            &[],
-        )?;
-
-        let latest_review = reviews
-            .iter()
-            .filter(|review| review.user.id == viewer.id)
-            .cloned()
-            .filter_map(ReviewResponse::into_opinionated)
-            .max_by(|left, right| {
-                left.submitted_at
-                    .cmp(&right.submitted_at)
-                    .then_with(|| left.id.cmp(&right.id))
-            });
-        let currently_requested_team_ids: HashSet<i64> =
-            requests.teams.iter().map(|team| team.id).collect();
-        let latest_request = timeline
-            .into_iter()
-            .filter_map(|event| {
-                event.into_review_request(
-                    viewer,
-                    viewer_team_ids,
-                    trust_team_notification,
-                    &currently_requested_team_ids,
-                )
-            })
-            .max_by(|left, right| {
-                left.created_at
-                    .cmp(&right.created_at)
-                    .then_with(|| left.event_id.cmp(&right.event_id))
-            });
-        let non_opinionated_review_after_request = latest_request.as_ref().is_some_and(|request| {
-            reviews.iter().any(|review| {
-                review.user.id == viewer.id
-                    && !matches!(review.state.as_str(), "APPROVED" | "CHANGES_REQUESTED")
-                    && review
-                        .submitted_at
-                        .is_some_and(|submitted| submitted >= request.created_at)
-            })
-        });
-
-        Ok(PullRequestState {
-            id: pull.id,
-            number: pull.number,
-            url: pull.html_url,
-            title: pull.title,
-            author: pull.user,
-            state: pull.state,
-            draft: pull.draft,
-            merged: pull.merged,
-            head_sha: pull.head.sha,
-            head_ref: pull.head.reference,
-            base_sha: pull.base.sha,
-            base_ref: pull.base.reference,
-            directly_requested: requests.users.iter().any(|user| user.id == viewer.id),
-            requested_team_ids: requests.teams.into_iter().map(|team| team.id).collect(),
-            latest_review,
-            latest_request,
-            non_opinionated_review_after_request,
-        })
+        self.pull_request_states(
+            &[(full_name, number)],
+            viewer,
+            viewer_team_ids,
+            trust_team_notification,
+        )?
+        .pop()
+        .expect("one result per requested pull request")
     }
 
-    /// Refresh the inexpensive pull-request core in one REST request while
-    /// retaining authoritative review and request state from the last full
-    /// hydration.
+    /// Read [`Self::pull_request_state`] for many pull requests with batched
+    /// GraphQL queries: one `gh` process per [`PULL_REQUEST_BATCH_SIZE`] pull
+    /// requests, rather than at least four REST requests for each.
     ///
-    /// This is intended for frequent tracked-PR checks. It detects lifecycle,
-    /// draft, head/base, author, title, and URL changes without re-fetching the
-    /// requested-reviewer, review, and issue-timeline collections. Call
-    /// [`Self::pull_request_state`] after notification discovery and before a
-    /// dispatch that needs freshly authoritative review/request state.
-    pub fn refresh_pull_request_core(
+    /// The outer error fails every pull request: transport failure, rate
+    /// limiting, or cancellation. Otherwise the result for `pulls[i]` is at
+    /// index `i`, and a missing pull request or repository is
+    /// [`GhError::NotFound`].
+    pub fn pull_request_states(
         &self,
-        full_name: &str,
-        cached: &PullRequestState,
-    ) -> Result<PullRequestState> {
-        validate_full_name(full_name)?;
-        let endpoint = format!("/repos/{full_name}/pulls/{}", cached.number);
-        let pull: PullResponse = self.get_json(&endpoint)?;
-        if pull.id != cached.id || pull.number != cached.number {
-            return Err(GhError::Protocol(format!(
-                "pull request identity changed while refreshing {full_name}#{} \
-                 (expected id {}, received id {} and number {})",
-                cached.number, cached.id, pull.id, pull.number
-            )));
+        pulls: &[(&str, u64)],
+        viewer: &Viewer,
+        viewer_team_ids: &[i64],
+        trust_team_notification: bool,
+    ) -> Result<Vec<Result<PullRequestState>>> {
+        let mut states = Vec::with_capacity(pulls.len());
+        for batch in pulls.chunks(PULL_REQUEST_BATCH_SIZE) {
+            let fetched = self.pull_request_batch(batch, viewer)?;
+            for (&(full_name, number), pull) in batch.iter().zip(fetched) {
+                states.push(
+                    pull.and_then(|pull| {
+                        self.read_remaining_pages(full_name, number, viewer, pull)
+                    })
+                    .and_then(GraphPullRequest::into_rest)
+                    .map(|(pull, requests, reviews, timeline)| {
+                        assemble_pull_request_state(
+                            pull,
+                            requests,
+                            reviews,
+                            timeline,
+                            viewer,
+                            viewer_team_ids,
+                            trust_team_notification,
+                        )
+                    }),
+                );
+            }
+        }
+        Ok(states)
+    }
+
+    /// Query one batch. Repository owner and name travel as GraphQL
+    /// variables; pull request numbers are integers and are inlined.
+    fn pull_request_batch(
+        &self,
+        batch: &[(&str, u64)],
+        viewer: &Viewer,
+    ) -> Result<Vec<Result<GraphPullRequest>>> {
+        let mut repositories: Vec<&str> = Vec::new();
+        let mut aliases = Vec::with_capacity(batch.len());
+        for &(full_name, _) in batch {
+            validate_full_name(full_name)?;
+            let index = repositories
+                .iter()
+                .position(|repository| *repository == full_name)
+                .unwrap_or_else(|| {
+                    repositories.push(full_name);
+                    repositories.len() - 1
+                });
+            aliases.push(index);
         }
 
-        Ok(PullRequestState {
-            id: pull.id,
-            number: pull.number,
-            url: pull.html_url,
-            title: pull.title,
-            author: pull.user,
-            state: pull.state,
-            draft: pull.draft,
-            merged: pull.merged,
-            head_sha: pull.head.sha,
-            head_ref: pull.head.reference,
-            base_sha: pull.base.sha,
-            base_ref: pull.base.reference,
-            directly_requested: cached.directly_requested,
-            requested_team_ids: cached.requested_team_ids.clone(),
-            latest_review: cached.latest_review.clone(),
-            latest_request: cached.latest_request.clone(),
-            non_opinionated_review_after_request: cached.non_opinionated_review_after_request,
+        let mut variables = serde_json::Map::new();
+        variables.insert("viewer".into(), viewer.login.clone().into());
+        let mut declarations = String::from("$viewer: String!");
+        let mut selections = String::new();
+        for (repository_index, full_name) in repositories.iter().enumerate() {
+            let (owner, name) = full_name.split_once('/').expect("validated full name");
+            variables.insert(format!("o{repository_index}"), owner.into());
+            variables.insert(format!("n{repository_index}"), name.into());
+            declarations.push_str(&format!(
+                ", $o{repository_index}: String!, $n{repository_index}: String!"
+            ));
+            selections.push_str(&format!(
+                " r{repository_index}: repository(owner: $o{repository_index}, name: $n{repository_index}) {{"
+            ));
+            for (pull_index, (&(_, number), &alias)) in batch.iter().zip(&aliases).enumerate() {
+                if alias == repository_index {
+                    selections.push_str(&format!(
+                        " p{pull_index}: pullRequest(number: {number}) {{ ...PullRequestState }}"
+                    ));
+                }
+            }
+            selections.push_str(" }");
+        }
+        let query = format!(
+            "query({declarations}) {{{selections} }} fragment PullRequestState on PullRequest {{ {} }}",
+            pull_request_fields()
+        );
+        let data = self.graphql(&query, variables)?;
+
+        Ok(batch
+            .iter()
+            .zip(&aliases)
+            .enumerate()
+            .map(|(pull_index, (&(full_name, number), &repository_index))| {
+                let repository_alias = format!("r{repository_index}");
+                let pull_alias = format!("p{pull_index}");
+                data.result_at(&[&repository_alias, &pull_alias], || {
+                    format!("{full_name}#{number}")
+                })
+            })
+            .collect())
+    }
+
+    /// Fetch any further pages of the three pull request connections. Busy
+    /// pull requests rarely need this, so pages are read one at a time.
+    fn read_remaining_pages(
+        &self,
+        full_name: &str,
+        number: u64,
+        viewer: &Viewer,
+        mut pull: GraphPullRequest,
+    ) -> Result<GraphPullRequest> {
+        self.extend_connection(
+            full_name,
+            number,
+            viewer,
+            PullConnection::ReviewRequests,
+            &mut pull.review_requests,
+        )?;
+        self.extend_connection(
+            full_name,
+            number,
+            viewer,
+            PullConnection::Reviews,
+            &mut pull.reviews,
+        )?;
+        self.extend_connection(
+            full_name,
+            number,
+            viewer,
+            PullConnection::ReviewRequestedEvents,
+            &mut pull.timeline_items,
+        )?;
+        Ok(pull)
+    }
+
+    fn extend_connection<T: DeserializeOwned>(
+        &self,
+        full_name: &str,
+        number: u64,
+        viewer: &Viewer,
+        kind: PullConnection,
+        connection: &mut Connection<T>,
+    ) -> Result<()> {
+        let (owner, name) = full_name.split_once('/').expect("validated full name");
+        let mut visited = HashSet::new();
+        while connection.page_info.has_next_page {
+            let cursor = connection.page_info.end_cursor.clone().ok_or_else(|| {
+                GhError::Protocol(format!(
+                    "{full_name}#{number}: {} page has no end cursor",
+                    kind.field()
+                ))
+            })?;
+            if !visited.insert(cursor.clone()) {
+                return Err(GhError::Protocol(format!(
+                    "{full_name}#{number}: pagination loop in {}",
+                    kind.field()
+                )));
+            }
+            let mut variables = serde_json::Map::new();
+            variables.insert("o".into(), owner.into());
+            variables.insert("n".into(), name.into());
+            variables.insert("after".into(), cursor.into());
+            let mut declarations = String::from("$o: String!, $n: String!, $after: String!");
+            if kind == PullConnection::Reviews {
+                variables.insert("viewer".into(), viewer.login.clone().into());
+                declarations.push_str(", $viewer: String!");
+            }
+            let query = format!(
+                "query({declarations}) {{ r: repository(owner: $o, name: $n) {{ p: pullRequest(number: {number}) {{ {} }} }} }}",
+                kind.selection(true)
+            );
+            let data = self.graphql(&query, variables)?;
+            let mut page: GraphConnectionPage<T> =
+                data.result_at(&["r", "p"], || format!("{full_name}#{number}"))?;
+            let mut next = page.0.remove(kind.field()).ok_or_else(|| {
+                GhError::Protocol(format!(
+                    "{full_name}#{number}: {} page is missing",
+                    kind.field()
+                ))
+            })?;
+            connection.nodes.append(&mut next.nodes);
+            connection.page_info = next.page_info;
+        }
+        Ok(())
+    }
+
+    /// Run one GraphQL query. GraphQL reports most failures inside an HTTP
+    /// 200 response, and `gh` then exits nonzero, so success is decided from
+    /// the HTTP status and the `errors` array rather than the exit status.
+    fn graphql(
+        &self,
+        query: &str,
+        variables: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<GraphData> {
+        const ENDPOINT: &str = "graphql";
+        let body = serde_json::to_vec(&serde_json::json!({
+            "query": query,
+            "variables": variables,
+        }))
+        .map_err(|error| GhError::Protocol(format!("could not encode GraphQL query: {error}")))?;
+        let mut args: Vec<OsString> = vec![
+            "api".into(),
+            "graphql".into(),
+            "--hostname".into(),
+            API_HOST.into(),
+            "--include".into(),
+            "--input".into(),
+            "-".into(),
+        ];
+        args.push("-H".into());
+        args.push(API_VERSION_HEADER.into());
+        let response = self.run(ENDPOINT, args, Some(body))?;
+        if !(200..300).contains(&response.metadata.status) {
+            return Err(GhError::Status {
+                endpoint: ENDPOINT.to_owned(),
+                metadata: Box::new(response.metadata),
+                body: response.body,
+                stderr: response.stderr,
+            });
+        }
+        let decoded: GraphResponse = decode_body(ENDPOINT, &response.body)?;
+        let (located, unlocated): (Vec<_>, Vec<_>) = decoded
+            .errors
+            .into_iter()
+            .partition(|error| !error.path.is_empty());
+        if located
+            .iter()
+            .chain(&unlocated)
+            .any(|error| error.kind.as_deref() == Some("RATE_LIMITED"))
+            || !unlocated.is_empty()
+        {
+            // Errors that belong to no pull request fail the whole query.
+            return Err(GhError::Status {
+                endpoint: ENDPOINT.to_owned(),
+                metadata: Box::new(response.metadata),
+                body: response.body,
+                stderr: response.stderr,
+            });
+        }
+        Ok(GraphData {
+            data: decoded.data.unwrap_or(serde_json::Value::Null),
+            errors: located,
         })
     }
 
@@ -448,28 +611,54 @@ impl GhClient {
     }
 
     fn request(&self, endpoint: &str, extra_headers: &[String]) -> Result<ApiResponse> {
+        let mut args: Vec<OsString> = vec![
+            "api".into(),
+            "--hostname".into(),
+            API_HOST.into(),
+            "--include".into(),
+            "--method".into(),
+            "GET".into(),
+            "-H".into(),
+            ACCEPT_HEADER.into(),
+            "-H".into(),
+            API_VERSION_HEADER.into(),
+        ];
+        for header in extra_headers {
+            args.push("-H".into());
+            args.push(header.into());
+        }
+        args.push(endpoint.into());
+        self.run(endpoint, args, None)
+    }
+
+    /// Run `gh` with `args`, writing `input` to its standard input, and parse
+    /// the `--include` output. `endpoint` names the request in errors.
+    fn run(
+        &self,
+        endpoint: &str,
+        args: Vec<OsString>,
+        input: Option<Vec<u8>>,
+    ) -> Result<ApiResponse> {
         let mut command = Command::new(&self.executable);
         command
-            .arg("api")
-            .arg("--hostname")
-            .arg(API_HOST)
-            .arg("--include")
-            .arg("--method")
-            .arg("GET")
-            .arg("-H")
-            .arg(ACCEPT_HEADER)
-            .arg("-H")
-            .arg(API_VERSION_HEADER);
-        for header in extra_headers {
-            command.arg("-H").arg(header);
-        }
-        command.arg(endpoint);
-        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            .args(args)
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         configure_process_group(&mut command);
         let mut child = command.spawn().map_err(|source| GhError::Spawn {
             executable: PathBuf::from(&self.executable),
             source,
         })?;
+        if let Some(input) = input {
+            let mut stdin = child.stdin.take().expect("stdin was piped");
+            // A write error means gh exited early; its output reports why.
+            thread::spawn(move || stdin.write_all(&input));
+        }
         let mut stdout = child.stdout.take().expect("stdout was piped");
         let mut stderr = child.stderr.take().expect("stderr was piped");
         let stdout_reader = thread::spawn(move || {
@@ -752,7 +941,422 @@ fn validate_full_name(full_name: &str) -> Result<()> {
     }
 }
 
+/// Combine the pull request, its requested reviewers, its reviews, and its
+/// review-request timeline events into the state used for actionability.
+fn assemble_pull_request_state(
+    pull: PullResponse,
+    requests: RequestedReviewers,
+    reviews: Vec<ReviewResponse>,
+    timeline: Vec<TimelineEvent>,
+    viewer: &Viewer,
+    viewer_team_ids: &[i64],
+    trust_team_notification: bool,
+) -> PullRequestState {
+    let latest_review = reviews
+        .iter()
+        .filter(|review| review.user.id == viewer.id)
+        .cloned()
+        .filter_map(ReviewResponse::into_opinionated)
+        .max_by(|left, right| {
+            left.submitted_at
+                .cmp(&right.submitted_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+    let currently_requested_team_ids: HashSet<i64> =
+        requests.teams.iter().map(|team| team.id).collect();
+    let latest_request = timeline
+        .into_iter()
+        .filter_map(|event| {
+            event.into_review_request(
+                viewer,
+                viewer_team_ids,
+                trust_team_notification,
+                &currently_requested_team_ids,
+            )
+        })
+        .max_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.event_id.cmp(&right.event_id))
+        });
+    let non_opinionated_review_after_request = latest_request.as_ref().is_some_and(|request| {
+        reviews.iter().any(|review| {
+            review.user.id == viewer.id
+                && !matches!(review.state.as_str(), "APPROVED" | "CHANGES_REQUESTED")
+                && review
+                    .submitted_at
+                    .is_some_and(|submitted| submitted >= request.created_at)
+        })
+    });
+
+    PullRequestState {
+        id: pull.id,
+        number: pull.number,
+        url: pull.html_url,
+        title: pull.title,
+        author: pull.user,
+        state: pull.state,
+        draft: pull.draft,
+        merged: pull.merged,
+        head_sha: pull.head.sha,
+        head_ref: pull.head.reference,
+        base_sha: pull.base.sha,
+        base_ref: pull.base.reference,
+        directly_requested: requests.users.iter().any(|user| user.id == viewer.id),
+        requested_team_ids: requests.teams.into_iter().map(|team| team.id).collect(),
+        latest_review,
+        latest_request,
+        non_opinionated_review_after_request,
+    }
+}
+
+const ACTOR_FIELDS: &str = "__typename login ... on User { databaseId } ... on Bot { databaseId } ... on Mannequin { databaseId }";
+const REQUESTED_REVIEWER_FIELDS: &str =
+    "requestedReviewer { __typename ... on User { databaseId login } ... on Team { databaseId } }";
+
+fn pull_request_fields() -> String {
+    format!(
+        "databaseId number url title state isDraft merged \
+         headRefOid headRefName baseRefOid baseRefName author {{ {ACTOR_FIELDS} }} {} {} {}",
+        PullConnection::ReviewRequests.selection(false),
+        PullConnection::Reviews.selection(false),
+        PullConnection::ReviewRequestedEvents.selection(false),
+    )
+}
+
+/// The paginated pull request connections read for pull request state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PullConnection {
+    ReviewRequests,
+    /// Only the viewer's reviews: the state never uses anyone else's.
+    Reviews,
+    /// The issue timeline, filtered to review-request events.
+    ReviewRequestedEvents,
+}
+
+impl PullConnection {
+    fn field(self) -> &'static str {
+        match self {
+            Self::ReviewRequests => "reviewRequests",
+            Self::Reviews => "reviews",
+            Self::ReviewRequestedEvents => "timelineItems",
+        }
+    }
+
+    fn selection(self, after: bool) -> String {
+        let after = if after { ", after: $after" } else { "" };
+        let (arguments, nodes) = match self {
+            Self::ReviewRequests => (String::new(), REQUESTED_REVIEWER_FIELDS.to_owned()),
+            Self::Reviews => (
+                ", author: $viewer".to_owned(),
+                "databaseId state submittedAt commit { oid } author { login ... on User { databaseId } }"
+                    .to_owned(),
+            ),
+            Self::ReviewRequestedEvents => (
+                ", itemTypes: [REVIEW_REQUESTED_EVENT]".to_owned(),
+                format!("... on ReviewRequestedEvent {{ id createdAt {REQUESTED_REVIEWER_FIELDS} }}"),
+            ),
+        };
+        format!(
+            "{}(first: 100{arguments}{after}) {{ pageInfo {{ hasNextPage endCursor }} nodes {{ {nodes} }} }}",
+            self.field()
+        )
+    }
+}
+
 #[derive(Deserialize)]
+struct GraphResponse {
+    data: Option<serde_json::Value>,
+    #[serde(default)]
+    errors: Vec<GraphErrorEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphErrorEntry {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    message: String,
+    #[serde(default)]
+    path: Vec<serde_json::Value>,
+}
+
+/// A GraphQL `data` object with the errors that GraphQL attached to paths
+/// inside it.
+struct GraphData {
+    data: serde_json::Value,
+    errors: Vec<GraphErrorEntry>,
+}
+
+impl GraphData {
+    /// Decode the value at `path`, or report the errors that apply to it. An
+    /// error applies when its path and `path` agree on their common prefix,
+    /// so a missing repository fails each of its pull requests.
+    fn result_at<T: DeserializeOwned>(
+        &self,
+        path: &[&str],
+        describe: impl Fn() -> String,
+    ) -> Result<T> {
+        let errors: Vec<&GraphErrorEntry> = self
+            .errors
+            .iter()
+            .filter(|error| {
+                error
+                    .path
+                    .iter()
+                    .zip(path)
+                    .all(|(segment, expected)| segment.as_str() == Some(*expected))
+            })
+            .collect();
+        if errors.iter().any(|error| {
+            error.kind.as_deref() == Some("NOT_FOUND") && error.path.len() <= path.len()
+        }) {
+            return Err(GhError::NotFound { what: describe() });
+        }
+        if !errors.is_empty() {
+            let messages: Vec<&str> = errors.iter().map(|error| error.message.as_str()).collect();
+            return Err(GhError::Protocol(format!(
+                "{}: {}",
+                describe(),
+                messages.join("; ")
+            )));
+        }
+        let value = path
+            .iter()
+            .fold(&self.data, |value, segment| &value[*segment]);
+        if value.is_null() {
+            return Err(GhError::Protocol(format!(
+                "{} is missing from the GraphQL response",
+                describe()
+            )));
+        }
+        T::deserialize(value).map_err(|source| GhError::Decode {
+            endpoint: "graphql".into(),
+            source,
+            body: value.to_string(),
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Connection<T> {
+    page_info: PageInfo,
+    nodes: Vec<Option<T>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PageInfo {
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+
+/// One page of a single connection, keyed by its field name.
+#[derive(Deserialize)]
+struct GraphConnectionPage<T>(HashMap<String, Connection<T>>);
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphPullRequest {
+    database_id: i64,
+    number: u64,
+    url: String,
+    title: String,
+    state: String,
+    is_draft: bool,
+    merged: bool,
+    head_ref_oid: String,
+    head_ref_name: String,
+    base_ref_oid: String,
+    base_ref_name: String,
+    author: Option<GraphActor>,
+    review_requests: Connection<GraphReviewRequest>,
+    reviews: Connection<GraphReview>,
+    timeline_items: Connection<GraphReviewRequestedEvent>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphActor {
+    #[serde(rename = "__typename")]
+    typename: String,
+    login: String,
+    database_id: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphReviewRequest {
+    requested_reviewer: Option<GraphReviewer>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphReviewer {
+    #[serde(rename = "__typename")]
+    typename: String,
+    database_id: Option<i64>,
+    login: Option<String>,
+}
+
+impl GraphReviewer {
+    fn user(&self) -> Option<Viewer> {
+        if self.typename != "User" {
+            return None;
+        }
+        Some(Viewer {
+            id: self.database_id?,
+            login: self.login.clone()?,
+        })
+    }
+
+    fn team(&self) -> Option<TeamId> {
+        if self.typename != "Team" {
+            return None;
+        }
+        Some(TeamId {
+            id: self.database_id?,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphReview {
+    database_id: Option<i64>,
+    state: String,
+    submitted_at: Option<DateTime<Utc>>,
+    commit: Option<GraphCommit>,
+    author: Option<GraphReviewAuthor>,
+}
+
+#[derive(Deserialize)]
+struct GraphCommit {
+    oid: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphReviewAuthor {
+    login: String,
+    database_id: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphReviewRequestedEvent {
+    id: String,
+    created_at: DateTime<Utc>,
+    requested_reviewer: Option<GraphReviewer>,
+}
+
+impl GraphPullRequest {
+    /// Convert to the REST shapes, so that REST-compatible IDs, logins, and
+    /// states reach the stored pull request state and the review envelope.
+    fn into_rest(
+        self,
+    ) -> Result<(
+        PullResponse,
+        RequestedReviewers,
+        Vec<ReviewResponse>,
+        Vec<TimelineEvent>,
+    )> {
+        let user = match self.author {
+            None => Viewer {
+                id: GHOST_USER_ID,
+                login: "ghost".into(),
+            },
+            Some(actor) => Viewer {
+                id: actor.database_id.ok_or_else(|| {
+                    GhError::Protocol(format!(
+                        "{}: author {} ({}) has no database ID",
+                        self.url, actor.login, actor.typename
+                    ))
+                })?,
+                // REST names bot accounts with a `[bot]` suffix.
+                login: if actor.typename == "Bot" {
+                    format!("{}[bot]", actor.login)
+                } else {
+                    actor.login
+                },
+            },
+        };
+        let pull = PullResponse {
+            id: self.database_id,
+            number: self.number,
+            html_url: self.url,
+            title: self.title,
+            user,
+            // REST reports a merged pull request as `closed` with `merged`.
+            state: if self.state == "OPEN" {
+                "open"
+            } else {
+                "closed"
+            }
+            .into(),
+            draft: self.is_draft,
+            merged: self.merged,
+            head: PullRevision {
+                sha: self.head_ref_oid,
+                reference: self.head_ref_name,
+            },
+            base: PullRevision {
+                sha: self.base_ref_oid,
+                reference: self.base_ref_name,
+            },
+        };
+        let reviewers: Vec<GraphReviewer> = self
+            .review_requests
+            .nodes
+            .into_iter()
+            .flatten()
+            .filter_map(|request| request.requested_reviewer)
+            .collect();
+        let requests = RequestedReviewers {
+            users: reviewers.iter().filter_map(GraphReviewer::user).collect(),
+            teams: reviewers.iter().filter_map(GraphReviewer::team).collect(),
+        };
+        let reviews = self
+            .reviews
+            .nodes
+            .into_iter()
+            .flatten()
+            .filter_map(|review| {
+                let author = review.author?;
+                Some(ReviewResponse {
+                    id: review.database_id?,
+                    user: Viewer {
+                        id: author.database_id?,
+                        login: author.login,
+                    },
+                    state: review.state,
+                    commit_id: review.commit.map(|commit| commit.oid),
+                    submitted_at: review.submitted_at,
+                })
+            })
+            .collect();
+        let timeline = self
+            .timeline_items
+            .nodes
+            .into_iter()
+            .flatten()
+            .map(|event| {
+                let reviewer = event.requested_reviewer;
+                TimelineEvent::ReviewRequested {
+                    // GraphQL has no numeric ID for these events. The node ID
+                    // equals the REST `node_id`, which is what is stored.
+                    id: 0,
+                    node_id: Some(event.id),
+                    created_at: event.created_at,
+                    requested_reviewer: reviewer.as_ref().and_then(GraphReviewer::user),
+                    requested_team: reviewer.as_ref().and_then(GraphReviewer::team),
+                }
+            })
+            .collect();
+        Ok((pull, requests, reviews, timeline))
+    }
+}
+
 struct PullResponse {
     id: i64,
     number: u64,
@@ -760,26 +1364,19 @@ struct PullResponse {
     title: String,
     user: Viewer,
     state: String,
-    #[serde(default)]
     draft: bool,
-    #[serde(default)]
     merged: bool,
     head: PullRevision,
     base: PullRevision,
 }
 
-#[derive(Deserialize)]
 struct PullRevision {
     sha: String,
-    #[serde(rename = "ref")]
     reference: String,
 }
 
-#[derive(Deserialize)]
 struct RequestedReviewers {
-    #[serde(default)]
     users: Vec<Viewer>,
-    #[serde(default)]
     teams: Vec<TeamId>,
 }
 
@@ -1099,30 +1696,38 @@ mod tests {
         assert_eq!(fs::read_to_string(calls).unwrap().lines().count(), 1);
     }
 
+    /// Write a fake `gh` that records each GraphQL request body in `calls`
+    /// and answers from `script`, a shell `case` body over `$input`.
     #[cfg(unix)]
-    #[test]
-    fn enriches_pull_request_and_selects_latest_opinionated_viewer_review() {
+    fn fake_graphql_gh(directory: &std::path::Path, script: &str) -> PathBuf {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
 
-        let temp = tempfile::tempdir().unwrap();
-        let script = temp.path().join("fake-gh");
+        let path = directory.join("fake-gh");
         fs::write(
-            &script,
-            r#"#!/bin/sh
-case "$*" in
-  *requested_reviewers*) body='{"users":[{"id":1,"login":"me"}],"teams":[{"id":77}]}' ; link='' ;;
-  *reviews*page=2*) body='[{"id":12,"user":{"id":1,"login":"me"},"state":"CHANGES_REQUESTED","commit_id":"old-head","submitted_at":"2030-01-02T00:00:00Z"}]' ; link='' ;;
-  *reviews*) body='[{"id":11,"user":{"id":1,"login":"me"},"state":"APPROVED","commit_id":"older-head","submitted_at":"2030-01-01T00:00:00Z"},{"id":13,"user":{"id":2,"login":"other"},"state":"APPROVED","commit_id":"head","submitted_at":"2030-01-03T00:00:00Z"}]' ; link='Link: <https://api.github.com/repos/acme/widgets/pulls/42/reviews?per_page=100&page=2>; rel="next"' ;;
-  *timeline*) body='[{"event":"cross-referenced","created_at":"2030-01-02T00:00:00Z"},{"id":20,"node_id":"RRE_user","event":"review_requested","created_at":"2030-01-01T00:00:00Z","requested_reviewer":{"id":1,"login":"me"}},{"id":21,"node_id":"RRE_team","event":"review_requested","created_at":"2030-01-03T00:00:00Z","requested_team":{"id":77}}]' ; link='' ;;
-  *pulls/42*) body='{"id":99,"number":42,"html_url":"https://github.com/acme/widgets/pull/42","title":"Change","user":{"id":3,"login":"author"},"state":"open","draft":false,"merged":false,"head":{"sha":"head","ref":"feature"},"base":{"sha":"base","ref":"main"}}' ; link='' ;;
-  *) exit 2 ;;
-esac
-printf 'HTTP/2 200 OK\n%s\n\n%s' "$link" "$body"
-"#,
+            &path,
+            format!(
+                "#!/bin/sh\ninput=$(cat)\nprintf '%s\\n' \"$input\" >> '{}'\n{script}\n",
+                directory.join("calls").display()
+            ),
         )
         .unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enriches_pull_request_and_selects_latest_opinionated_viewer_review() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = fake_graphql_gh(
+            temp.path(),
+            r#"case "$input" in
+  *'after: $after'*) body='{"data":{"r":{"p":{"reviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"databaseId":12,"state":"CHANGES_REQUESTED","submittedAt":"2030-01-02T00:00:00Z","commit":{"oid":"old-head"},"author":{"login":"me","databaseId":1}}]}}}}}' ;;
+  *) body='{"data":{"r0":{"p0":{"databaseId":99,"number":42,"url":"https://github.com/acme/widgets/pull/42","title":"Change","state":"OPEN","isDraft":false,"merged":false,"headRefOid":"head","headRefName":"feature","baseRefOid":"base","baseRefName":"main","author":{"__typename":"User","login":"author","databaseId":3},"reviewRequests":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"requestedReviewer":{"__typename":"User","databaseId":1,"login":"me"}},{"requestedReviewer":{"__typename":"Team","databaseId":77}}]},"reviews":{"pageInfo":{"hasNextPage":true,"endCursor":"c1"},"nodes":[{"databaseId":11,"state":"APPROVED","submittedAt":"2030-01-01T00:00:00Z","commit":{"oid":"older-head"},"author":{"login":"me","databaseId":1}}]},"timelineItems":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"RRE_user","createdAt":"2030-01-01T00:00:00Z","requestedReviewer":{"__typename":"User","databaseId":1,"login":"me"}},{"id":"RRE_team","createdAt":"2030-01-03T00:00:00Z","requestedReviewer":{"__typename":"Team","databaseId":77}}]}}}}}' ;;
+esac
+printf 'HTTP/2 200 OK\n\n%s' "$body""#,
+        );
 
         let pull = GhClient::with_executable(&script)
             .pull_request_state(
@@ -1136,9 +1741,13 @@ printf 'HTTP/2 200 OK\n%s\n\n%s' "$link" "$body"
                 false,
             )
             .unwrap();
+        assert_eq!(pull.id, 99);
+        assert_eq!(pull.state, "open");
+        assert_eq!(pull.author.login, "author");
         assert!(pull.directly_requested);
         assert_eq!(pull.requested_team_ids, vec![77]);
         assert_eq!(pull.head_sha, "head");
+        assert_eq!(pull.base_ref, "main");
         let review = pull.latest_review.unwrap();
         assert_eq!(review.id, 12);
         assert_eq!(review.state, ReviewState::ChangesRequested);
@@ -1147,78 +1756,106 @@ printf 'HTTP/2 200 OK\n%s\n\n%s' "$link" "$body"
         assert_eq!(request.event_id, "RRE_team");
         assert_eq!(request.kind, ReviewRequestKind::Team);
         assert_eq!(request.requested_id, 77);
+
+        let calls = std::fs::read_to_string(temp.path().join("calls")).unwrap();
+        let calls: Vec<serde_json::Value> = calls
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(calls.len(), 2, "one batch query and one review page");
+        assert_eq!(calls[0]["variables"]["viewer"], "me");
+        assert_eq!(calls[1]["variables"]["after"], "c1");
     }
 
     #[cfg(unix)]
     #[test]
-    fn core_refresh_uses_one_request_and_preserves_authoritative_review_state() {
-        use std::fs;
-        use std::os::unix::fs::PermissionsExt;
-
+    fn batches_pull_requests_in_one_query_and_reports_missing_ones() {
         let temp = tempfile::tempdir().unwrap();
-        let script = temp.path().join("fake-gh");
-        let calls = temp.path().join("calls");
-        fs::write(
-            &script,
+        let empty = r#"{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}"#;
+        let pull = |number: u64, author: &str, state: &str| {
             format!(
-                r#"#!/bin/sh
-printf '%s\n' "$*" >> '{}'
-printf 'HTTP/2 200 OK\n\n%s' '{{"id":99,"number":42,"html_url":"https://github.com/acme/widgets/pull/42","title":"Renamed","user":{{"id":4,"login":"new-author"}},"state":"closed","draft":false,"merged":true,"head":{{"sha":"new-head","ref":"feature-v2"}},"base":{{"sha":"new-base","ref":"trunk"}}}}'
-"#,
-                calls.display()
+                r#"{{"databaseId":{number}00,"number":{number},"url":"https://github.com/acme/widgets/pull/{number}","title":"PR {number}","state":"{state}","isDraft":false,"merged":{},"headRefOid":"h","headRefName":"f","baseRefOid":"b","baseRefName":"main","author":{author},"reviewRequests":{empty},"reviews":{empty},"timelineItems":{empty}}}"#,
+                state == "MERGED"
+            )
+        };
+        let body = format!(
+            r#"{{"data":{{"r0":{{"p0":{},"p1":null,"p3":{}}},"r1":null}},"errors":[{{"type":"NOT_FOUND","path":["r0","p1"],"message":"Could not resolve to a PullRequest with the number of 2."}},{{"type":"NOT_FOUND","path":["r1"],"message":"Could not resolve to a Repository with the name 'other/gone'."}}]}}"#,
+            pull(
+                1,
+                r#"{"__typename":"Bot","login":"dependabot","databaseId":49699333}"#,
+                "MERGED"
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-        let review = OpinionatedReview {
-            id: 12,
-            state: ReviewState::ChangesRequested,
-            commit_sha: Some("old-head".into()),
-            submitted_at: Some("2030-01-02T00:00:00Z".parse().unwrap()),
-        };
-        let request = ReviewRequestEvent {
-            event_id: "RRE_team".into(),
-            created_at: "2030-01-03T00:00:00Z".parse().unwrap(),
-            kind: ReviewRequestKind::Team,
-            requested_id: 77,
-        };
-        let cached = PullRequestState {
-            id: 99,
-            number: 42,
-            url: "old-url".into(),
-            title: "Old title".into(),
-            author: Viewer {
-                id: 3,
-                login: "old-author".into(),
-            },
-            state: "open".into(),
-            draft: true,
-            merged: false,
-            head_sha: "old-head".into(),
-            head_ref: "feature".into(),
-            base_sha: "old-base".into(),
-            base_ref: "main".into(),
-            directly_requested: false,
-            requested_team_ids: vec![77],
-            latest_review: Some(review.clone()),
-            latest_request: Some(request.clone()),
-            non_opinionated_review_after_request: false,
-        };
+            pull(4, "null", "OPEN"),
+        );
+        let script = fake_graphql_gh(
+            temp.path(),
+            &format!("printf 'HTTP/2 200 OK\\n\\n%s' '{body}'\nexit 1"),
+        );
 
-        let refreshed = GhClient::with_executable(&script)
-            .refresh_pull_request_core("acme/widgets", &cached)
+        let results = GhClient::with_executable(&script)
+            .pull_request_states(
+                &[
+                    ("acme/widgets", 1),
+                    ("acme/widgets", 2),
+                    ("other/gone", 3),
+                    ("acme/widgets", 4),
+                ],
+                &Viewer {
+                    id: 1,
+                    login: "me".into(),
+                },
+                &[],
+                false,
+            )
             .unwrap();
-        assert_eq!(fs::read_to_string(calls).unwrap().lines().count(), 1);
-        assert_eq!(refreshed.state, "closed");
-        assert!(!refreshed.draft);
-        assert!(refreshed.merged);
-        assert_eq!(refreshed.author.id, 4);
-        assert_eq!(refreshed.head_sha, "new-head");
-        assert_eq!(refreshed.head_ref, "feature-v2");
-        assert_eq!(refreshed.base_sha, "new-base");
-        assert_eq!(refreshed.base_ref, "trunk");
-        assert_eq!(refreshed.latest_review.unwrap().id, review.id);
-        assert_eq!(refreshed.latest_request.unwrap(), request);
-        assert_eq!(refreshed.requested_team_ids, vec![77]);
+        assert_eq!(results.len(), 4);
+        let merged = results[0].as_ref().unwrap();
+        assert_eq!(merged.author.login, "dependabot[bot]");
+        assert_eq!(merged.author.id, 49699333);
+        assert_eq!(merged.state, "closed");
+        assert!(merged.merged);
+        assert!(results[1].as_ref().unwrap_err().is_not_found());
+        assert!(results[2].as_ref().unwrap_err().is_not_found());
+        let ghost = results[3].as_ref().unwrap();
+        assert_eq!(
+            (ghost.author.id, ghost.author.login.as_str()),
+            (GHOST_USER_ID, "ghost")
+        );
+
+        let calls = std::fs::read_to_string(temp.path().join("calls")).unwrap();
+        assert_eq!(calls.lines().count(), 1);
+        let call: serde_json::Value = serde_json::from_str(calls.lines().next().unwrap()).unwrap();
+        assert_eq!(call["variables"]["o0"], "acme");
+        assert_eq!(call["variables"]["n1"], "gone");
+        let query = call["query"].as_str().unwrap();
+        assert!(
+            !query.contains("acme"),
+            "names must travel as variables: {query}"
+        );
+        assert!(query.contains("p3: pullRequest(number: 4)"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn graphql_rate_limit_fails_the_whole_batch() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = fake_graphql_gh(
+            temp.path(),
+            r#"printf 'HTTP/2 200 OK\nX-RateLimit-Remaining: 0\nX-RateLimit-Reset: 1\n\n%s' '{"data":null,"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded"}]}'
+exit 1"#,
+        );
+        let error = GhClient::with_executable(&script)
+            .pull_request_states(
+                &[("acme/widgets", 1)],
+                &Viewer {
+                    id: 1,
+                    login: "me".into(),
+                },
+                &[],
+                false,
+            )
+            .unwrap_err();
+        assert!(matches!(error, GhError::Status { .. }));
+        assert_eq!(error.metadata().unwrap().rate_limit_remaining, Some(0));
     }
 }

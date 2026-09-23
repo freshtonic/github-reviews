@@ -17,11 +17,13 @@ use uuid::Uuid;
 
 use crate::cli::{Cli, Command, Mode, PullRequestSelector, RunArgs};
 use crate::db::{
-    ActionStatus, Database, NewReviewAction, RegisteredRepositoryRecord, ReviewAction,
-    TrackedPullRequest,
+    ActionStatus, Database, NewReviewAction, NotificationDiscovery, RegisteredRepositoryRecord,
+    ReviewAction, TrackedPullRequest,
 };
 use crate::git::{FetchSpec, GitError, GitTools};
-use crate::github::{GhClient, GhError, NotificationPoll, parse_pull_request_api_url};
+use crate::github::{
+    GhClient, GhError, NotificationPoll, PULL_REQUEST_BATCH_SIZE, parse_pull_request_api_url,
+};
 use crate::model::{
     ActionReason, Actionability, EnvelopePullRequest, EnvelopeRepository, EnvelopeRequest,
     Notification, RegisteredRepository, ReviewEnvelope, ReviewRequestKind, ReviewState, Viewer,
@@ -33,7 +35,6 @@ const HOST: &str = "github.com";
 const LEASE_DURATION: TimeDelta = TimeDelta::seconds(90);
 const LEASE_HEARTBEAT: Duration = Duration::from_secs(30);
 const DISCOVERY_BATCH_LIMIT: usize = 100;
-const DISCOVERY_PROGRESS_INTERVAL: usize = 10;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct InProgressReview {
@@ -597,13 +598,16 @@ fn process_discoveries(
     let mut processed = 0;
     let mut api_available = true;
     let mut reported_registrations = HashSet::new();
-    for _ in 0..DISCOVERY_BATCH_LIMIT {
+    while processed < DISCOVERY_BATCH_LIMIT {
         if stopping() {
             api_available = false;
             break;
         }
-        if processed > 0 && processed % DISCOVERY_PROGRESS_INTERVAL == 0 {
+        if processed > 0 {
             let remaining = db.due_discovery_count(HOST, viewer.id, Utc::now())?;
+            if remaining == 0 {
+                break;
+            }
             info!(
                 processed,
                 remaining,
@@ -616,103 +620,113 @@ fn process_discoveries(
                 &mut reported_registrations,
             )?;
         }
+
+        // Claim one GraphQL batch. Notifications that need no GitHub read
+        // complete at once.
         let now = Utc::now();
-        let Some(discovery) = db.claim_pending_discovery(HOST, viewer.id, now)? else {
-            break;
-        };
-        processed += 1;
-        let notification = &discovery.notification;
-        let Some(registration) = registrations.get(&discovery.repository_id) else {
-            db.complete_discovery(HOST, viewer.id, &discovery.notification_id, now)?;
-            continue;
-        };
-        let Some(url) = notification.subject.url.as_deref() else {
-            warn!(notification = %notification.id, "review notification has no pull request URL");
-            db.complete_discovery(HOST, viewer.id, &discovery.notification_id, now)?;
-            continue;
-        };
-        let (_, number) = match parse_pull_request_api_url(url) {
-            Ok(identity) => identity,
-            Err(error) => {
-                warn!(notification = %notification.id, %error, "ignoring malformed pull request notification");
+        let mut claimed = Vec::new();
+        while claimed.len() < PULL_REQUEST_BATCH_SIZE && processed < DISCOVERY_BATCH_LIMIT {
+            let Some(discovery) = db.claim_pending_discovery(HOST, viewer.id, now)? else {
+                break;
+            };
+            processed += 1;
+            let notification = &discovery.notification;
+            let Some(registration) = registrations.get(&discovery.repository_id) else {
                 db.complete_discovery(HOST, viewer.id, &discovery.notification_id, now)?;
                 continue;
-            }
-        };
-        let full_name = &registration.repository.repository.full_name;
-        let pull = match gh.pull_request_state(
-            full_name,
-            number,
+            };
+            let Some(url) = notification.subject.url.as_deref() else {
+                warn!(notification = %notification.id, "review notification has no pull request URL");
+                db.complete_discovery(HOST, viewer.id, &discovery.notification_id, now)?;
+                continue;
+            };
+            let (_, number) = match parse_pull_request_api_url(url) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    warn!(notification = %notification.id, %error, "ignoring malformed pull request notification");
+                    db.complete_discovery(HOST, viewer.id, &discovery.notification_id, now)?;
+                    continue;
+                }
+            };
+            claimed.push((
+                discovery,
+                &registration.repository.repository.full_name,
+                number,
+            ));
+        }
+        if claimed.is_empty() {
+            break;
+        }
+
+        let pulls: Vec<(&str, u64)> = claimed
+            .iter()
+            .map(|(_, full_name, number)| (full_name.as_str(), *number))
+            .collect();
+        let results = match gh.pull_request_states(
+            &pulls,
             viewer,
             viewer_team_ids,
             trust_notification_for_teams,
         ) {
-            Ok(pull) => pull,
-            Err(error)
-                if error
-                    .metadata()
-                    .is_some_and(|metadata| metadata.status == 404) =>
-            {
-                db.complete_discovery(HOST, viewer.id, &discovery.notification_id, now)?;
-                continue;
-            }
-            Err(GhError::Cancelled { .. }) => {
-                // The daemon is stopping. Leave the discovery due now so the
-                // next daemon picks it up without a retry delay.
-                db.defer_discovery(
-                    HOST,
-                    viewer.id,
-                    &discovery.notification_id,
-                    "daemon stopped while notification discovery was running",
-                    now,
-                    now,
-                )?;
-                api_available = false;
-                break;
-            }
+            Ok(results) => results,
             Err(error) => {
-                let delay = retry_delay_for_gh_error(&error).unwrap_or_else(|| {
-                    let exponent = discovery.attempts.saturating_sub(1).min(5);
-                    Duration::from_secs(30_u64.saturating_mul(1_u64 << exponent))
-                });
-                warn!(notification = %notification.id, %error, "pull request discovery deferred");
-                db.defer_discovery(
-                    HOST,
-                    viewer.id,
-                    &discovery.notification_id,
-                    &error.to_string(),
-                    now + chrono_duration(delay),
-                    now,
-                )?;
-                if is_rate_limited(&error) {
+                if !matches!(error, GhError::Cancelled { .. }) {
+                    warn!(pull_requests = claimed.len(), %error, "pull request discovery deferred");
+                }
+                for (discovery, _, _) in &claimed {
+                    defer_discovery_after_error(db, viewer.id, discovery, &error, now)?;
+                }
+                if is_rate_limited(&error) || matches!(error, GhError::Cancelled { .. }) {
                     api_available = false;
                     break;
                 }
                 continue;
             }
         };
-        // The notification is historical evidence that the viewer or one of
-        // their teams was requested. GitHub removes reviewers from the active
-        // request set after any submitted review, so requiring current request
-        // membership here would lose CHANGES_REQUESTED follow-up tracking.
-        if pull.author.id == viewer.id {
+        for ((discovery, full_name, _), result) in claimed.into_iter().zip(results) {
+            let pull = match result {
+                Ok(pull) => pull,
+                Err(error) if error.is_not_found() => {
+                    db.complete_discovery(HOST, viewer.id, &discovery.notification_id, now)?;
+                    continue;
+                }
+                Err(error) => {
+                    if !matches!(error, GhError::Cancelled { .. }) {
+                        warn!(notification = %discovery.notification.id, %error, "pull request discovery deferred");
+                    }
+                    defer_discovery_after_error(db, viewer.id, &discovery, &error, now)?;
+                    if is_rate_limited(&error) || matches!(error, GhError::Cancelled { .. }) {
+                        api_available = false;
+                    }
+                    continue;
+                }
+            };
+            // The notification is historical evidence that the viewer or one of
+            // their teams was requested. GitHub removes reviewers from the active
+            // request set after any submitted review, so requiring current request
+            // membership here would lose CHANGES_REQUESTED follow-up tracking.
+            if pull.author.id == viewer.id {
+                db.complete_discovery(HOST, viewer.id, &discovery.notification_id, now)?;
+                continue;
+            }
+            db.upsert_tracked_pull_request(&TrackedPullRequest {
+                host: HOST.into(),
+                viewer_id: viewer.id,
+                repository_id: discovery.repository_id,
+                repository_full_name: full_name.clone(),
+                pull_request: pull,
+                notification_id: discovery.notification_id.clone(),
+                notification_updated_at: discovery.notification_updated_at,
+                notification: discovery.raw,
+                active: true,
+                next_check_at: now,
+                updated_at: now,
+            })?;
             db.complete_discovery(HOST, viewer.id, &discovery.notification_id, now)?;
-            continue;
         }
-        db.upsert_tracked_pull_request(&TrackedPullRequest {
-            host: HOST.into(),
-            viewer_id: viewer.id,
-            repository_id: discovery.repository_id,
-            repository_full_name: full_name.clone(),
-            pull_request: pull,
-            notification_id: discovery.notification_id.clone(),
-            notification_updated_at: discovery.notification_updated_at,
-            notification: discovery.raw,
-            active: true,
-            next_check_at: now,
-            updated_at: now,
-        })?;
-        db.complete_discovery(HOST, viewer.id, &discovery.notification_id, now)?;
+        if !api_available {
+            break;
+        }
     }
     let remaining = db.due_discovery_count(HOST, viewer.id, Utc::now())?;
     info!(
@@ -723,6 +737,38 @@ fn process_discoveries(
     );
     log_registrations_waiting_for_next_cycle(db, registrations, &mut reported_registrations)?;
     Ok(api_available)
+}
+
+/// Return a discovery to the queue after a failed GitHub read. A cancelled
+/// read means the daemon is stopping, so the discovery stays due at once.
+fn defer_discovery_after_error(
+    db: &mut Database,
+    viewer_id: i64,
+    discovery: &NotificationDiscovery,
+    error: &GhError,
+    now: chrono::DateTime<Utc>,
+) -> Result<()> {
+    let (message, retry_at) = if matches!(error, GhError::Cancelled { .. }) {
+        (
+            "daemon stopped while notification discovery was running".to_owned(),
+            now,
+        )
+    } else {
+        let delay = retry_delay_for_gh_error(error).unwrap_or_else(|| {
+            let exponent = discovery.attempts.saturating_sub(1).min(5);
+            Duration::from_secs(30_u64.saturating_mul(1_u64 << exponent))
+        });
+        (error.to_string(), now + chrono_duration(delay))
+    };
+    db.defer_discovery(
+        HOST,
+        viewer_id,
+        &discovery.notification_id,
+        &message,
+        retry_at,
+        now,
+    )?;
+    Ok(())
 }
 
 fn log_registrations_waiting_for_next_cycle(
@@ -805,50 +851,11 @@ fn refresh_tracked(
     stopping: &dyn Fn() -> bool,
 ) -> Result<bool> {
     let now = Utc::now();
-    for mut tracked in db.due_tracked_pull_requests(HOST, viewer.id, now, 1000)? {
-        if stopping() {
-            return Ok(false);
-        }
-        let Some(registration) = registrations.get(&tracked.repository_id) else {
-            db.deactivate_tracked_pull_request(
-                HOST,
-                viewer.id,
-                tracked.repository_id,
-                tracked.pull_request.id,
-                now,
-            )?;
-            continue;
-        };
-        let canonical_name = &registration.repository.repository.full_name;
-        // CHANGES_REQUESTED follow-up tracking needs only the PR's core state
-        // and head/base revisions on frequent polls. Reuse the cached review
-        // authority here; discovery and dispatch still perform full reads.
-        let authoritative_refresh_due = tracked.updated_at.timestamp().div_euclid(15 * 60)
-            != now.timestamp().div_euclid(15 * 60);
-        let refresh = if !authoritative_refresh_due
-            && tracked
-                .pull_request
-                .latest_review
-                .as_ref()
-                .is_some_and(|review| review.state == ReviewState::ChangesRequested)
-        {
-            gh.refresh_pull_request_core(canonical_name, &tracked.pull_request)
-        } else {
-            gh.pull_request_state(
-                canonical_name,
-                tracked.pull_request.number,
-                viewer,
-                viewer_team_ids,
-                trust_notification_for_teams,
-            )
-        };
-        let pull = match refresh {
-            Ok(pull) => pull,
-            Err(error)
-                if error
-                    .metadata()
-                    .is_some_and(|metadata| metadata.status == 404) =>
-            {
+    let mut due = Vec::new();
+    for tracked in db.due_tracked_pull_requests(HOST, viewer.id, now, 1000)? {
+        match registrations.get(&tracked.repository_id) {
+            Some(registration) => due.push((tracked, registration)),
+            None => {
                 db.deactivate_tracked_pull_request(
                     HOST,
                     viewer.id,
@@ -856,120 +863,167 @@ fn refresh_tracked(
                     tracked.pull_request.id,
                     now,
                 )?;
-                continue;
             }
+        }
+    }
+    let mut due = due.into_iter().peekable();
+    while due.peek().is_some() {
+        if stopping() {
+            return Ok(false);
+        }
+        let batch: Vec<_> = due.by_ref().take(PULL_REQUEST_BATCH_SIZE).collect();
+        let pulls: Vec<(&str, u64)> = batch
+            .iter()
+            .map(|(tracked, registration)| {
+                (
+                    registration.repository.repository.full_name.as_str(),
+                    tracked.pull_request.number,
+                )
+            })
+            .collect();
+        let results = match gh.pull_request_states(
+            &pulls,
+            viewer,
+            viewer_team_ids,
+            trust_notification_for_teams,
+        ) {
+            Ok(results) => results,
             Err(GhError::Cancelled { .. }) => return Ok(false),
             Err(error) => {
-                warn!(repository = %tracked.repository_full_name, pull = tracked.pull_request.number, %error, "could not refresh pull request");
+                warn!(pull_requests = batch.len(), %error, "could not refresh tracked pull requests");
                 if is_rate_limited(&error) {
                     return Ok(false);
                 }
                 continue;
             }
         };
-        let effective_teams = if trust_notification_for_teams {
-            pull.requested_team_ids.as_slice()
-        } else {
-            viewer_team_ids
-        };
-        let actionability = classify_actionability(viewer, effective_teams, &pull);
-        tracked.repository_full_name = canonical_name.clone();
-        tracked.pull_request = pull.clone();
-        tracked.active = match &actionability {
-            Actionability::Inactive(_) => false,
-            Actionability::Dormant(_) => pull
-                .latest_review
-                .as_ref()
-                .is_some_and(|review| review.state == ReviewState::ChangesRequested),
-            Actionability::Actionable(_) => true,
-        };
-        tracked.next_check_at = now + chrono_duration(interval);
-        tracked.updated_at = now;
-        db.upsert_tracked_pull_request(&tracked)?;
+        for ((mut tracked, registration), refresh) in batch.into_iter().zip(results) {
+            let canonical_name = &registration.repository.repository.full_name;
+            let pull = match refresh {
+                Ok(pull) => pull,
+                Err(error) if error.is_not_found() => {
+                    db.deactivate_tracked_pull_request(
+                        HOST,
+                        viewer.id,
+                        tracked.repository_id,
+                        tracked.pull_request.id,
+                        now,
+                    )?;
+                    continue;
+                }
+                Err(GhError::Cancelled { .. }) => return Ok(false),
+                Err(error) => {
+                    warn!(repository = %tracked.repository_full_name, pull = tracked.pull_request.number, %error, "could not refresh pull request");
+                    if is_rate_limited(&error) {
+                        return Ok(false);
+                    }
+                    continue;
+                }
+            };
+            let effective_teams = if trust_notification_for_teams {
+                pull.requested_team_ids.as_slice()
+            } else {
+                viewer_team_ids
+            };
+            let actionability = classify_actionability(viewer, effective_teams, &pull);
+            tracked.repository_full_name = canonical_name.clone();
+            tracked.pull_request = pull.clone();
+            tracked.active = match &actionability {
+                Actionability::Inactive(_) => false,
+                Actionability::Dormant(_) => pull
+                    .latest_review
+                    .as_ref()
+                    .is_some_and(|review| review.state == ReviewState::ChangesRequested),
+                Actionability::Actionable(_) => true,
+            };
+            tracked.next_check_at = now + chrono_duration(interval);
+            tracked.updated_at = now;
+            db.upsert_tracked_pull_request(&tracked)?;
 
-        let Actionability::Actionable(reason) = actionability else {
-            continue;
-        };
-        let fallback_event_id = format!(
-            "{}@{}",
-            tracked.notification_id,
-            tracked.notification_updated_at.timestamp_millis()
-        );
-        let (request_kind, event_id) = pull.latest_request.as_ref().map_or_else(
-            || {
-                (
-                    if pull.directly_requested {
-                        "user"
-                    } else {
-                        "team"
-                    }
-                    .to_owned(),
-                    fallback_event_id,
-                )
-            },
-            |request| {
-                (
-                    match request.kind {
-                        ReviewRequestKind::User => "user",
-                        ReviewRequestKind::Team => "team",
-                    }
-                    .to_owned(),
-                    request.event_id.clone(),
-                )
-            },
-        );
-        let envelope = ReviewEnvelope {
-            schema_version: 1,
-            reason,
-            viewer: viewer.clone(),
-            repository: EnvelopeRepository {
-                id: tracked.repository_id,
-                full_name: canonical_name.clone(),
-                local_path: registration.repository.local_path.clone(),
-            },
-            request: EnvelopeRequest {
-                kind: request_kind,
-                event_id: event_id.clone(),
-            },
-            pull_request: EnvelopePullRequest {
-                id: pull.id,
-                number: pull.number,
-                url: pull.url.clone(),
-                title: pull.title.clone(),
-                author: pull.author.clone(),
-                head_sha: pull.head_sha.clone(),
-                base_sha: pull.base_sha.clone(),
-                base_ref: pull.base_ref.clone(),
-                head_ref: pull.head_ref.clone(),
-            },
-            review: pull.latest_review.clone(),
-            notification: tracked.notification.clone(),
-        };
-        let trigger_key = match reason {
-            ActionReason::HeadChangedAfterChangesRequested => format!(
-                "review:{}",
-                pull.latest_review.as_ref().map_or(0, |review| review.id)
-            ),
-            _ => event_id,
-        };
-        let result = db.enqueue_action(
-            &NewReviewAction {
-                host: HOST.into(),
-                viewer_id: viewer.id,
-                repository_id: tracked.repository_id,
-                repository_full_name: canonical_name.clone(),
-                pull_request_id: pull.id,
-                pull_request_number: pull.number,
-                head_sha: pull.head_sha.clone(),
-                trigger_key,
-                reason: reason.as_str().into(),
-                envelope,
-                due_at: now,
-            },
-            now,
-        )?;
-        if result.inserted {
-            info!(repository = %tracked.repository_full_name, pull = pull.number, action = result.action_id, reason = reason.as_str(), "review action queued");
+            let Actionability::Actionable(reason) = actionability else {
+                continue;
+            };
+            let fallback_event_id = format!(
+                "{}@{}",
+                tracked.notification_id,
+                tracked.notification_updated_at.timestamp_millis()
+            );
+            let (request_kind, event_id) = pull.latest_request.as_ref().map_or_else(
+                || {
+                    (
+                        if pull.directly_requested {
+                            "user"
+                        } else {
+                            "team"
+                        }
+                        .to_owned(),
+                        fallback_event_id,
+                    )
+                },
+                |request| {
+                    (
+                        match request.kind {
+                            ReviewRequestKind::User => "user",
+                            ReviewRequestKind::Team => "team",
+                        }
+                        .to_owned(),
+                        request.event_id.clone(),
+                    )
+                },
+            );
+            let envelope = ReviewEnvelope {
+                schema_version: 1,
+                reason,
+                viewer: viewer.clone(),
+                repository: EnvelopeRepository {
+                    id: tracked.repository_id,
+                    full_name: canonical_name.clone(),
+                    local_path: registration.repository.local_path.clone(),
+                },
+                request: EnvelopeRequest {
+                    kind: request_kind,
+                    event_id: event_id.clone(),
+                },
+                pull_request: EnvelopePullRequest {
+                    id: pull.id,
+                    number: pull.number,
+                    url: pull.url.clone(),
+                    title: pull.title.clone(),
+                    author: pull.author.clone(),
+                    head_sha: pull.head_sha.clone(),
+                    base_sha: pull.base_sha.clone(),
+                    base_ref: pull.base_ref.clone(),
+                    head_ref: pull.head_ref.clone(),
+                },
+                review: pull.latest_review.clone(),
+                notification: tracked.notification.clone(),
+            };
+            let trigger_key = match reason {
+                ActionReason::HeadChangedAfterChangesRequested => format!(
+                    "review:{}",
+                    pull.latest_review.as_ref().map_or(0, |review| review.id)
+                ),
+                _ => event_id,
+            };
+            let result = db.enqueue_action(
+                &NewReviewAction {
+                    host: HOST.into(),
+                    viewer_id: viewer.id,
+                    repository_id: tracked.repository_id,
+                    repository_full_name: canonical_name.clone(),
+                    pull_request_id: pull.id,
+                    pull_request_number: pull.number,
+                    head_sha: pull.head_sha.clone(),
+                    trigger_key,
+                    reason: reason.as_str().into(),
+                    envelope,
+                    due_at: now,
+                },
+                now,
+            )?;
+            if result.inserted {
+                info!(repository = %tracked.repository_full_name, pull = pull.number, action = result.action_id, reason = reason.as_str(), "review action queued");
+            }
         }
     }
     Ok(true)
@@ -1039,11 +1093,7 @@ fn process_action_inner(
         trust_notification_for_teams,
     ) {
         Ok(pull) => pull,
-        Err(error)
-            if error
-                .metadata()
-                .is_some_and(|metadata| metadata.status == 404) =>
-        {
+        Err(error) if error.is_not_found() => {
             db.cancel_action(action.id, "pull request no longer exists", Utc::now())?;
             return Ok(());
         }
@@ -1179,11 +1229,7 @@ fn process_action_inner(
         trust_notification_for_teams,
     ) {
         Ok(pull) => pull,
-        Err(error)
-            if error
-                .metadata()
-                .is_some_and(|metadata| metadata.status == 404) =>
-        {
+        Err(error) if error.is_not_found() => {
             db.cancel_action(action.id, "pull request no longer exists", Utc::now())?;
             return Ok(());
         }
@@ -1375,9 +1421,12 @@ fn is_rate_limited(error: &GhError) -> bool {
             || matches!(metadata.status, 429)
     });
     let body_signals_secondary_limit = match error {
-        GhError::Status { metadata, body, .. } if metadata.status == 403 => {
+        GhError::Status { metadata, body, .. } => {
             let body = body.to_ascii_lowercase();
-            body.contains("secondary rate limit") || body.contains("abuse detection")
+            (metadata.status == 403
+                && (body.contains("secondary rate limit") || body.contains("abuse detection")))
+                // GraphQL reports its rate limit as an error type in a 200.
+                || body.contains("\"rate_limited\"")
         }
         _ => false,
     };
@@ -1489,6 +1538,21 @@ mod tests {
                 ..Default::default()
             }),
             body: r#"{"message":"You have exceeded a secondary rate limit."}"#.into(),
+            stderr: String::new(),
+        };
+        assert!(is_rate_limited(&error));
+    }
+
+    #[test]
+    fn recognizes_graphql_rate_limit_error_type() {
+        let error = GhError::Status {
+            endpoint: "graphql".into(),
+            metadata: Box::new(crate::github::ResponseMetadata {
+                status: 200,
+                ..Default::default()
+            }),
+            body: r#"{"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded"}]}"#
+                .into(),
             stderr: String::new(),
         };
         assert!(is_rate_limited(&error));
