@@ -182,6 +182,10 @@ def codex_command(schema_path: Path, operator_prompt: str) -> list[str]:
         "multi_agent",
         "--disable",
         "goals",
+        # Domain rules take effect only through Codex's network proxy.
+        # Without it, an enabled network is unrestricted.
+        "--enable",
+        "network_proxy",
         "-c",
         'model_reasoning_effort="high"',
         "-c",
@@ -194,10 +198,11 @@ def codex_command(schema_path: Path, operator_prompt: str) -> list[str]:
         f"permissions.{profile}.network.enabled=true",
         "-c",
         f"permissions.{profile}.network.allow_local_binding=false",
+        # One inline table: `-c` splits keys on every dot, including dots
+        # inside quoted keys, so `domains."github.com"` is not one domain.
         "-c",
-        f'permissions.{profile}.network.domains."api.github.com"="allow"',
-        "-c",
-        f'permissions.{profile}.network.domains."github.com"="allow"',
+        f'permissions.{profile}.network.domains='
+        '{"api.github.com"="allow","github.com"="allow"}',
         "--",
         review_prompt,
     ]

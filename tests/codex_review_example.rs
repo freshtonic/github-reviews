@@ -130,7 +130,8 @@ fn codex_review_example_runs_with_guardrails_and_reports_operations() {
         "goals",
         "extends=\":read-only\"",
         "network.enabled=true",
-        "api.github.com",
+        "network_proxy",
+        r#"network.domains={"api.github.com"="allow","github.com"="allow"}"#,
         "Additional review instructions supplied by the operator",
         INSTRUCTIONS,
     ] {

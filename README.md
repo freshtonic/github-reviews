@@ -121,7 +121,7 @@ Omit the last argument to run the review without additional instructions.
 
 The example requires Codex CLI 0.156 or newer, `gh` authenticated with permission to write pull-request reviews, and Python 3. It deliberately does not require `jq`.
 
-Codex receives read-only filesystem access and GitHub-only network access. It can inspect the checked-out repository, the verified pull-request head at `FETCH_HEAD`, and the verified base named by `pull_request.base_sha` in the envelope. User-configured skills and plugins remain loaded, while goals and multi-agent delegation are disabled to constrain expense.
+Codex receives read-only filesystem access and GitHub-only network access. Codex enforces the domain allowlist only through its network proxy, so the example enables the experimental `network_proxy` feature. Without that feature, the network is not restricted. Codex can inspect the checked-out repository, the verified pull-request head at `FETCH_HEAD`, and the verified base named by `pull_request.base_sha` in the envelope. User-configured skills and plugins remain loaded, while goals and multi-agent delegation are disabled to constrain expense.
 
 This is an unattended, side-effecting example. Codex inspects the live pull-request conversation and uses `gh` directly to submit whichever review verdict, general comments, inline comments, replies, or thread-resolution changes it considers appropriate. The prompt prohibits other GitHub mutations and treats pull-request content as untrusted, but the GitHub credential remains the ultimate authorization boundary. Use a narrowly scoped credential and review the script before running it.
 
