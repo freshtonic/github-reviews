@@ -590,6 +590,22 @@ impl Database {
             .map_err(Into::into)
     }
 
+    pub fn due_discovery_count(
+        &self,
+        host: &str,
+        viewer_id: i64,
+        now: DateTime<Utc>,
+    ) -> Result<usize> {
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM notification_discoveries
+             WHERE host = ?1 AND viewer_id = ?2
+               AND status = 'pending' AND due_at <= ?3",
+            params![host, viewer_id, millis(now)],
+            |row| row.get(0),
+        )?;
+        Ok(usize::try_from(count).unwrap_or(usize::MAX))
+    }
+
     /// Claims one due notification for enrichment. Poll validators may already
     /// have advanced; the joined raw notification remains durable until this
     /// item is completed.
@@ -2297,6 +2313,12 @@ mod tests {
         assert_eq!(discoveries.len(), 1);
         assert_eq!(discoveries[0].notification_id, "100");
         assert_eq!(discoveries[0].raw, raw);
+        assert_eq!(
+            database
+                .due_discovery_count("github.com", 11, at(60))
+                .unwrap(),
+            1
+        );
     }
 
     #[test]

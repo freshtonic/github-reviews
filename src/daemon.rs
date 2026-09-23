@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -32,6 +32,8 @@ use crate::runner::{ReviewCommand, RunOutcome};
 const HOST: &str = "github.com";
 const LEASE_DURATION: TimeDelta = TimeDelta::seconds(90);
 const LEASE_HEARTBEAT: Duration = Duration::from_secs(30);
+const DISCOVERY_BATCH_LIMIT: usize = 100;
+const DISCOVERY_PROGRESS_INTERVAL: usize = 10;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct InProgressReview {
@@ -566,11 +568,39 @@ fn process_discoveries(
     trust_notification_for_teams: bool,
     registrations: &HashMap<i64, RegisteredRepositoryRecord>,
 ) -> Result<bool> {
-    for _ in 0..100 {
+    let started = Instant::now();
+    let pending = db.due_discovery_count(HOST, viewer.id, Utc::now())?;
+    if pending == 0 {
+        return Ok(true);
+    }
+    info!(
+        pending,
+        batch_limit = DISCOVERY_BATCH_LIMIT,
+        "processing pull request discovery backlog; new repository registrations load next polling cycle"
+    );
+    let mut processed = 0;
+    let mut api_available = true;
+    let mut reported_registrations = HashSet::new();
+    for _ in 0..DISCOVERY_BATCH_LIMIT {
+        if processed > 0 && processed % DISCOVERY_PROGRESS_INTERVAL == 0 {
+            let remaining = db.due_discovery_count(HOST, viewer.id, Utc::now())?;
+            info!(
+                processed,
+                remaining,
+                elapsed_seconds = started.elapsed().as_secs(),
+                "pull request discovery backlog progress"
+            );
+            log_registrations_waiting_for_next_cycle(
+                db,
+                registrations,
+                &mut reported_registrations,
+            )?;
+        }
         let now = Utc::now();
         let Some(discovery) = db.claim_pending_discovery(HOST, viewer.id, now)? else {
             break;
         };
+        processed += 1;
         let notification = &discovery.notification;
         let Some(registration) = registrations.get(&discovery.repository_id) else {
             db.complete_discovery(HOST, viewer.id, &discovery.notification_id, now)?;
@@ -621,7 +651,8 @@ fn process_discoveries(
                     now,
                 )?;
                 if is_rate_limited(&error) {
-                    return Ok(false);
+                    api_available = false;
+                    break;
                 }
                 continue;
             }
@@ -649,7 +680,37 @@ fn process_discoveries(
         })?;
         db.complete_discovery(HOST, viewer.id, &discovery.notification_id, now)?;
     }
-    Ok(true)
+    let remaining = db.due_discovery_count(HOST, viewer.id, Utc::now())?;
+    info!(
+        processed,
+        remaining,
+        elapsed_seconds = started.elapsed().as_secs(),
+        "pull request discovery batch complete; repository registrations will reload next polling cycle"
+    );
+    log_registrations_waiting_for_next_cycle(db, registrations, &mut reported_registrations)?;
+    Ok(api_available)
+}
+
+fn log_registrations_waiting_for_next_cycle(
+    db: &Database,
+    registrations: &HashMap<i64, RegisteredRepositoryRecord>,
+    reported: &mut HashSet<String>,
+) -> Result<()> {
+    let mut waiting: Vec<_> = db
+        .list_registrations()?
+        .into_iter()
+        .filter(|registration| !registrations.contains_key(&registration.repository.repository.id))
+        .map(|registration| registration.repository.repository.full_name)
+        .filter(|full_name| reported.insert(full_name.clone()))
+        .collect();
+    waiting.sort();
+    if !waiting.is_empty() {
+        warn!(
+            repositories = %waiting.join(", "),
+            "new repository registration detected during pull request discovery; bootstrap delayed until next polling cycle"
+        );
+    }
+    Ok(())
 }
 
 fn notification_values(
