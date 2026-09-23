@@ -83,6 +83,25 @@ This is an unattended, side-effecting example. Codex inspects the live pull-requ
 
 The script reports confirmed operations on stdout and exits unsuccessfully if Codex reports that any intended operation failed. A timed-out or failed action can leave partial GitHub changes; retries inspect existing activity and are instructed not to duplicate it. The 15-minute timeout above limits each attempt, but the daemon can make up to three attempts before parking an action.
 
+## Example Claude reviewer
+
+[`examples/claude-review.py`](examples/claude-review.py) provides the same review-command contract using Claude Code. It runs Claude Opus at high effort in non-interactive mode, disables session persistence and subagents, and applies a USD 5 maximum API budget per attempt:
+
+```sh
+github-reviews run \
+  --mode async \
+  --max-concurrency 1 \
+  --review-timeout 15m \
+  --review-command /absolute/path/to/github-reviews/examples/claude-review.py \
+  'Concentrate on correctness, security, and missing tests.'
+```
+
+The example requires Claude Code 2.1.280 or newer, an authenticated Claude account or API configuration, `gh` authenticated with permission to write pull-request reviews, and Python 3.
+
+Configured Claude skills, plugins, and repository instructions remain loaded. The invocation uses `dontAsk` mode with pre-approved read tools, read-only Git commands, and the `gh` commands needed to inspect and update the exact pull request. File-editing tools and subagents are explicitly denied. Unlike the Codex example's OS-level filesystem sandbox, this boundary is enforced by Claude Code's permission rules; trusted user and project settings or hooks can affect those rules, so audit them before unattended use.
+
+Claude performs review operations directly through `gh` and returns a structured execution report. The wrapper fails closed when Claude exits unsuccessfully, omits structured output, reports a partial failure, or exceeds its budget. The daemon's timeout and retry behavior can still leave partial GitHub changes, so retries are instructed to inspect existing activity before acting.
+
 ## State and logging
 
 State is shared in `~/.config/github-reviews/state.sqlite3`. The directory and database are restricted to the current user. Run the daemon in the foreground under launchd, systemd, or another supervisor; logs are written to stderr. Set `RUST_LOG` to change verbosity.
