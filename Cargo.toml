@@ -1,0 +1,35 @@
+[package]
+name = "github-reviews"
+version = "0.1.0"
+edition = "2024"
+description = "Run local review automation for GitHub review requests"
+license = "MIT"
+
+[[bin]]
+name = "github-reviews"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+ctrlc = "3.4"
+dirs = "6.0"
+humantime = "2.1"
+rand = "0.9"
+rusqlite = { version = "0.37", features = ["bundled", "chrono"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+uuid = { version = "1.18", features = ["v4"] }
+wait-timeout = "0.2"
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.1"
+tempfile = "3.23"
+
+[profile.release]
+lto = true
+strip = true
