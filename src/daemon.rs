@@ -1387,7 +1387,7 @@ fn start_lease_heartbeat(
             }) {
                 Ok(true) => {}
                 Ok(false) => {
-                    error!("daemon lease could not be renewed; stopping daemon");
+                    error!("another daemon took over the lease; stopping daemon");
                     lease_lost.store(true, Ordering::SeqCst);
                 }
                 Err(error) => {

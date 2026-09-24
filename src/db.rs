@@ -1189,6 +1189,12 @@ impl Database {
         Ok(changed != 0)
     }
 
+    /// Extends a lease that `owner` still holds, even after it expired.
+    ///
+    /// A suspended process (for example, a sleeping laptop) cannot renew in
+    /// time. Expiry alone does not mean another daemon ran: any daemon that
+    /// acquires the expired lease replaces the owner, and releasing it deletes
+    /// the row. So an unchanged owner proves that no other daemon took over.
     pub fn renew_lease(
         &mut self,
         host: &str,
@@ -1205,7 +1211,7 @@ impl Database {
             .ok_or_else(|| anyhow!("lease expiry overflow"))?;
         Ok(self.connection.execute(
             "UPDATE daemon_leases SET expires_at = ?5, updated_at = ?4
-             WHERE host = ?1 AND viewer_id = ?2 AND owner = ?3 AND expires_at > ?4",
+             WHERE host = ?1 AND viewer_id = ?2 AND owner = ?3",
             params![host, viewer_id, owner, millis(now), millis(expires)],
         )? != 0)
     }
@@ -2500,6 +2506,53 @@ mod tests {
         assert!(
             database
                 .release_lease("github.com", 11, "daemon-b")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn expired_lease_renews_only_while_its_owner_still_holds_it() {
+        let (_directory, mut database) = database();
+        let lease = TimeDelta::seconds(30);
+        assert!(
+            database
+                .acquire_lease("github.com", 11, "reviewer", "daemon-a", at(100), lease)
+                .unwrap()
+        );
+        // The process was suspended past expiry, and no other daemon started.
+        assert!(
+            database
+                .renew_lease("github.com", 11, "daemon-a", at(1_000), lease)
+                .unwrap()
+        );
+        assert!(
+            !database
+                .acquire_lease("github.com", 11, "reviewer", "daemon-b", at(1_010), lease)
+                .unwrap(),
+            "the renewed lease is live again"
+        );
+
+        // Another daemon took over the expired lease.
+        assert!(
+            database
+                .acquire_lease("github.com", 11, "reviewer", "daemon-b", at(2_000), lease)
+                .unwrap()
+        );
+        assert!(
+            !database
+                .renew_lease("github.com", 11, "daemon-a", at(2_010), lease)
+                .unwrap()
+        );
+
+        // Another daemon took over and stopped again, releasing the lease.
+        assert!(
+            database
+                .release_lease("github.com", 11, "daemon-b")
+                .unwrap()
+        );
+        assert!(
+            !database
+                .renew_lease("github.com", 11, "daemon-a", at(2_020), lease)
                 .unwrap()
         );
     }
